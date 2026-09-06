@@ -1060,6 +1060,28 @@ def _parse_mode(config):
     return {"md": "md", "markdown": "md", "html": "html"}.get(mode)
 
 
+def _normalise_caption_mode(value, default="plain"):
+    mode = str(value or default).strip().lower()
+    return {
+        "markdown": "md",
+        "md": "md",
+        "html": "html",
+        "plain": "plain",
+        "none": "plain",
+    }.get(mode, default)
+
+
+def _split_bulk_caption_mode(value, default="plain"):
+    """Read an optional explicit `html:`, `md:`, or `plain:` prefix."""
+    text = str(value or "")
+    match = re.match(r"^\s*(html|markdown|md|plain)\s*:\s*([\s\S]*)$", text, re.IGNORECASE)
+    if match:
+        return _normalise_caption_mode(match.group(1), default), match.group(2)
+    if text.strip().lower() in {"html", "markdown", "md", "plain"}:
+        return _normalise_caption_mode(text.strip(), default), ""
+    return _normalise_caption_mode(default, default), text
+
+
 def _dedupe_key(pair_id, message):
     raw = f"{pair_id}:{message.id}:{message.text or ''}:{getattr(message, 'grouped_id', '')}"
     media = getattr(message, "media", None)
@@ -1307,13 +1329,15 @@ async def fast_download(media, progress_cb=None) -> str:
     # Temp file banao inside managed directory so accounting/cleanup works.
     suffix = ".tmp"
     if isinstance(media, MessageMediaDocument) and media.document:
+        has_filename_extension = False
         for attr in media.document.attributes:
             if isinstance(attr, DocumentAttributeFilename):
                 ext = Path(attr.file_name).suffix
                 if ext:
                     suffix = ext
+                    has_filename_extension = True
                 break
-        else:
+        if not has_filename_extension:
             mime = getattr(media.document, "mime_type", "")
             if "video" in mime:   suffix = ".mp4"
             elif "audio" in mime: suffix = ".mp3"
