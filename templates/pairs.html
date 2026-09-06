@@ -25,6 +25,8 @@
        <label>Caption template<textarea id="pair-caption-template" rows="3" placeholder="{caption}"></textarea></label>
        <div id="pair-caption-preview" class="caption-preview" aria-live="polite"></div>
        <p class="helper">Available: {caption} {filename} {filesize} {filesize_mb} {message_id} {source} {date} {time} {mime} {type} {duration} {resolution}</p>
+       <label>Custom URL buttons<textarea id="pair-custom-buttons" rows="3" placeholder="Join course | https://example.com&#10;Support | https://t.me/example"></textarea></label>
+       <p class="helper">One per line: <strong>Button text | https://url</strong>. Maximum 8 buttons. These are added to every forwarded/synced post for this pair.</p>
        <div class="check-list"><label><input class="caption-type" type="checkbox" value="text" checked> Caption text</label><label><input class="caption-type" type="checkbox" value="photo" checked> Caption photos</label><label><input class="caption-type" type="checkbox" value="video" checked> Caption videos</label><label><input class="caption-type" type="checkbox" value="doc" checked> Caption docs</label><label><input class="caption-type" type="checkbox" value="other" checked> Caption other</label></div>
       <div class="form-grid two"><label>Thumbnail image<input id="pair-thumbnail-file" type="file" accept="image/*"></label><div class="form-actions"><button class="button secondary" type="button" onclick="uploadPairThumbnail()">Upload thumbnail</button></div></div>
       <div class="form-section"><strong>Scheduling</strong><span>Keep timing rules scoped to this pair.</span></div>

@@ -20,6 +20,8 @@ after a successful login.
 The first startup without local state checks Telegram backup channel
 `-1003941432857` for the newest JSON state backup and restores it. The owner can
 also send `/backup` or `.backup` to upload the current state snapshot there.
+After startup, a verified state snapshot is uploaded automatically every five
+minutes; the Settings page reports the last success or failure.
 
 ## Storage safety
 
@@ -31,7 +33,10 @@ leftover failed downloads.
 Bulk commands are available through both the Telegram bot and owner userbot:
 `/refresh [task_id]`, `/helpfile`, `/editcaptions <channel> [template]`,
 `/mark <channel> header|footer <text>`, and a replied image with
-`/videothumbnail <channel>`. Caption edits can take their template from a
+`/videothumbnail <channel>`. Forwarding buttons can be configured with
+`/buttons <pair_id> Label | https://url; ...`, and existing channel messages
+can be updated with `/bulkbuttons <channel> Label | https://url; ...` or
+`clear`. Caption edits can take their template from a
 replied caption message or ask for it in the next message; `/cancel` and
 `.cancel` cancel that prompt.
 Bulk edits wait 3 seconds per Telegram action, pause 10 seconds after each

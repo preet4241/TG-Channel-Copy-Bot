@@ -190,6 +190,7 @@ message when an ID or username is not available.
 | `/refresh [task_id]` | Rescan the complete source history. |
 | `/tasks` | Show the task queue. |
 | `/autoforward on\|off` | Enable or disable global auto-forwarding. |
+| `/buttons <pair_id> <label> \| <url>; ...` | Add URL buttons to every post forwarded through a pair; use `clear` to remove them. |
 | `/caption <pair_id> on\|off [template]` | Configure a pair caption rule. |
 | `/setthumbnail <pair_id>` | Save a replied photo as a pair video thumbnail. |
 | `/setthumbnail <pair_id> off` | Disable a pair thumbnail. |
@@ -197,6 +198,7 @@ message when an ID or username is not available.
 | `/editcaptions <channel> [template]` | Bulk-edit captions in an existing channel. |
 | `/mark <channel> header\|footer <text>` | Add a header or footer to channel messages. |
 | `/videothumbnail <channel>` | Re-upload channel videos with a replied image as thumbnail. |
+| `/bulkbuttons <channel> <label> \| <url>; ...` | Add, replace, or clear URL buttons on existing channel messages. |
 | `/cancel` | Cancel a pending caption prompt. |
 | `/pause`, `/resume`, `/stop` | Control active sync work. |
 | `/reset` | Reset runtime configuration to defaults. |
@@ -335,11 +337,35 @@ it does not contain Telegram secrets.
 - Backup channel: `-1003941432857`.
 - On first startup without local state, the newest matching JSON backup is
   restored from that channel.
-- Completed or partially completed syncs upload a backup with a five-minute
-  throttle.
+- A background scheduler validates and uploads the current JSON snapshot every
+  five minutes. Uploads are serialized so manual, task-completion, and scheduled
+  backups cannot overwrite each other.
 - `/backup` and `.backup` force a current backup upload.
 - `sync_state.json.bak` is the previous valid local JSON snapshot and is used
   for recovery if the main JSON file is damaged.
+- The dashboard Settings page shows the last successful upload, current backup
+  status, and the last error. The upload is only marked successful after
+  Telegram confirms the document send.
+
+### Custom URL buttons
+
+Forwarding/sync buttons are configured per channel pair from the Dashboard
+pair editor or with `/buttons` / `.buttons`:
+
+```text
+/buttons <pair_id> Join | https://example.com; Support | https://t.me/example
+```
+
+For messages already published in a channel, use the bulk tool:
+
+```text
+/bulkbuttons <channel> Join | https://example.com; Support | https://t.me/example
+/bulkbuttons <channel> clear
+```
+
+Buttons are validated URL buttons (`https://`, `http://`, or `tg://`), with up
+to eight buttons per post. Bulk button edits update message reply markup and
+do not delete or rewrite the message caption/media.
 
 ## Files and storage
 

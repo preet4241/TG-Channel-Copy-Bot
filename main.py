@@ -113,6 +113,8 @@ BATCH_DELAY  = 10      # seconds after each batch
 MIN_RATE_DELAY = 3
 MAX_BATCH_TASKS = 50
 MAX_TASK_MESSAGES = 5000
+BACKUP_INTERVAL_SECONDS = 5 * 60
+MAX_CUSTOM_BUTTONS = 8
 TASK_PRIORITIES = {"low": 10, "normal": 20, "high": 30}
 RATE_PROFILES = {"very_safe": 5, "balanced": 3, "slow": 10}
 MESSAGE_TYPES = {"text", "photo", "video", "doc", "other"}
@@ -153,6 +155,45 @@ def _normalise_types(value, fallback=None):
     return list(dict.fromkeys(result)) or fallback
 
 
+def _parse_custom_buttons(value, strict=False):
+    """Parse one button per line or semicolon as ``Label | https://url``."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        raw_items = re.split(r"[;\n]+", value)
+    elif isinstance(value, (list, tuple)):
+        raw_items = value
+    else:
+        if strict:
+            raise ValueError("Custom buttons must be text or a list")
+        return []
+
+    buttons = []
+    errors = []
+    for item in raw_items:
+        if isinstance(item, dict):
+            label = str(item.get("text", item.get("label", ""))).strip()
+            url = str(item.get("url", "")).strip()
+        else:
+            parts = str(item).split("|", 1)
+            label = parts[0].strip() if parts else ""
+            url = parts[1].strip() if len(parts) > 1 else ""
+        if not label and not url:
+            continue
+        if not label or len(label) > 64:
+            errors.append("button text must be 1–64 characters")
+            continue
+        if not re.match(r"^(?:https?://|tg://)\S+$", url, re.IGNORECASE):
+            errors.append(f"invalid URL for '{label}'")
+            continue
+        buttons.append({"text": label, "url": url})
+        if len(buttons) >= MAX_CUSTOM_BUTTONS:
+            break
+    if errors and strict:
+        raise ValueError("; ".join(errors[:3]))
+    return buttons
+
+
 def _normalise_pair_setting(key, value):
     if key in {"include_keywords", "exclude_keywords"}:
         if isinstance(value, str):
@@ -177,6 +218,8 @@ def _normalise_pair_setting(key, value):
         return str(value).lower() if str(value).lower() in {"md", "html", "plain"} else "md"
     if key == "protected_behavior":
         return str(value).lower() if str(value).lower() in {"download", "skip"} else "download"
+    if key == "custom_buttons":
+        return _parse_custom_buttons(value)
     if key in {
         "remove_links", "remove_source_name", "auto_forward",
         "caption_enabled", "thumbnail_enabled",
@@ -375,6 +418,9 @@ state.setdefault("auto_stats", {"sent": 0, "failed": 0, "duplicates": 0})
 state["auto_stats"].setdefault("duplicates", 0)
 state.setdefault("backup_channel", DEFAULT_BACKUP_CHANNEL)
 state.setdefault("backup_last_upload_epoch", 0)
+state.setdefault("backup_last_attempt_epoch", 0)
+state.setdefault("backup_last_upload_status", "never")
+state.setdefault("backup_last_upload_error", "")
 if not state.get("pairs"):
     if state.get("source") and state.get("target"):
         state["pairs"] = [{
@@ -438,6 +484,9 @@ def _ensure_state_defaults_after_restore():
     state["auto_stats"].setdefault("duplicates", 0)
     state.setdefault("backup_channel", DEFAULT_BACKUP_CHANNEL)
     state.setdefault("backup_last_upload_epoch", 0)
+    state.setdefault("backup_last_attempt_epoch", 0)
+    state.setdefault("backup_last_upload_status", "never")
+    state.setdefault("backup_last_upload_error", "")
     state.setdefault("dedupe", {})
     state.setdefault("task_controls", {})
     state.setdefault("message_map", {})
@@ -528,33 +577,68 @@ async def restore_latest_backup():
 
 async def upload_state_backup(force=False):
     """Upload the current JSON state to the configured Telegram backup channel."""
-    now = time.time()
-    last_upload = float(state.get("backup_last_upload_epoch", 0) or 0)
-    if not force and now - last_upload < 300:
-        return False
-    backup_channel = state.get("backup_channel", DEFAULT_BACKUP_CHANNEL)
-    try:
-        save_state(state)
-        entity = await client.get_entity(backup_channel)
-        caption = (
-            "Archive Bot state backup\n"
-            f"Created: {datetime.now().isoformat(timespec='seconds')}\n"
-            f"Schema: {STATE_SCHEMA_VERSION}"
-        )
-        await client.send_file(entity, STATE_FILE, caption=caption, force_document=True)
-        state["backup_last_upload_epoch"] = now
-        save_state(state)
-        _log_live(f"💾 State backup uploaded to Telegram channel {backup_channel}")
-        return True
-    except Exception as exc:
-        logger.warning("Telegram state backup upload failed: %s", exc)
-        _log_live(f"⚠️ Backup upload failed: {type(exc).__name__}")
-        return False
+    async with _backup_lock:
+        now = time.time()
+        last_upload = float(state.get("backup_last_upload_epoch", 0) or 0)
+        if not force and now - last_upload < BACKUP_INTERVAL_SECONDS:
+            return False
+        backup_channel = state.get("backup_channel", DEFAULT_BACKUP_CHANNEL)
+        state["backup_last_attempt_epoch"] = now
+        state["backup_last_upload_status"] = "uploading"
+        state["backup_last_upload_error"] = ""
+        try:
+            # Save first, then validate the exact file that will be uploaded.
+            # This prevents a successful Telegram upload from containing a
+            # partially written or non-JSON local state file.
+            save_state(state)
+            with open(STATE_FILE, encoding="utf-8") as handle:
+                snapshot = json.load(handle)
+            if not isinstance(snapshot, dict):
+                raise ValueError("State backup JSON root must be an object")
+            entity = await client.get_entity(backup_channel)
+            caption = (
+                "Archive Bot state backup\n"
+                f"Created: {datetime.now().isoformat(timespec='seconds')}\n"
+                f"Schema: {STATE_SCHEMA_VERSION}"
+            )
+            sent = await client.send_file(
+                entity, STATE_FILE, caption=caption, force_document=True
+            )
+            if not sent:
+                raise RuntimeError("Telegram did not confirm the backup upload")
+            uploaded_at = time.time()
+            state["backup_last_upload_epoch"] = uploaded_at
+            state["backup_last_upload_status"] = "ok"
+            state["backup_last_upload_error"] = ""
+            state["backup_last_upload_message_id"] = getattr(sent, "id", None)
+            save_state(state)
+            _log_live(f"💾 State backup uploaded to Telegram channel {backup_channel}")
+            return True
+        except Exception as exc:
+            state["backup_last_upload_status"] = "failed"
+            state["backup_last_upload_error"] = f"{type(exc).__name__}: {exc}"
+            try:
+                save_state(state)
+            except Exception:
+                logger.exception("Could not persist backup failure status")
+            logger.warning("Telegram state backup upload failed: %s", exc)
+            _log_live(f"⚠️ Backup upload failed: {type(exc).__name__}")
+            return False
+
+
+async def backup_scheduler():
+    """Keep a verified Telegram state snapshot every five minutes."""
+    await asyncio.sleep(BACKUP_INTERVAL_SECONDS)
+    while True:
+        await upload_state_backup(force=True)
+        await asyncio.sleep(BACKUP_INTERVAL_SECONDS)
+
 
 # Sync requests are queued instead of being rejected while another sync runs.
 _task_queue = deque()
 _task_worker_running = False
 _auto_forward_lock = asyncio.Lock()
+_backup_lock = asyncio.Lock()
 
 
 def _task_view(task):
@@ -640,7 +724,15 @@ def _pair_config(pair):
         "caption_parse_mode": str(pair.get("caption_parse_mode", "md")),
         "thumbnail_enabled": bool(pair.get("thumbnail_enabled", False)),
         "thumbnail_path": str(pair.get("thumbnail_path", "")),
+        "custom_buttons": _parse_custom_buttons(pair.get("custom_buttons")),
     }
+
+
+def _telegram_buttons(config):
+    return [
+        Button.url(button["text"], button["url"])
+        for button in _parse_custom_buttons(config.get("custom_buttons"))
+    ]
 
 
 def _prepare_thumbnail(source_path):
@@ -858,6 +950,7 @@ async def send_album(target, messages, on_progress=None, config=None,
                      source_title="", source_entity=None):
     """Copy a Telegram album as one grouped post when possible."""
     config = config or _pair_config(None)
+    buttons = _telegram_buttons(config)
     source_entity = source_entity or getattr(messages[0], "chat", None)
     needs_rewrite = any([
         config["caption_prefix"], config["caption_suffix"],
@@ -875,7 +968,8 @@ async def send_album(target, messages, on_progress=None, config=None,
         return await client.send_file(
             target, [message.media for message in messages],
             caption=[message.text or "" for message in messages],
-            parse_mode=_parse_mode(config)
+            parse_mode=_parse_mode(config),
+            buttons=buttons or None,
         )
 
     paths = []
@@ -889,7 +983,8 @@ async def send_album(target, messages, on_progress=None, config=None,
         captions = [_edited_caption(message, config, source_title) for message in messages]
         return await client.send_file(
             target, paths, caption=captions, parse_mode=_parse_mode(config),
-            thumb=_thumbnail_path(config)
+            thumb=_thumbnail_path(config),
+            buttons=buttons or None,
         )
     finally:
         for path in paths:
@@ -1524,6 +1619,12 @@ HELP_CATEGORIES = [
                 "usage": "/autoforward on\n/autoforward off",
                 "bot_only": True,
             },
+            {
+                "commands": ["/buttons", ".buttons"],
+                "title": "Forwarding custom buttons",
+                "why": "Pair ke har synced ya live-forwarded post ke neeche URL buttons add karne ke liye.",
+                "usage": "/buttons <pair_id> Join | https://example.com; Support | https://t.me/example\nClear: /buttons <pair_id> clear",
+            },
         ],
         "dashboard_note": "Dashboard ke Channel pairs page mein har pair ka auto-forward toggle bhi hai. Pair-level choice ko wahan se manage karo.",
     },
@@ -1623,6 +1724,12 @@ HELP_CATEGORIES = [
                 "title": "State backup",
                 "why": "Current JSON/SQLite-backed state ka JSON snapshot Telegram backup channel mein upload karta hai.",
                 "usage": "/backup  or  .backup",
+            },
+            {
+                "commands": ["/bulkbuttons", ".bulkbuttons"],
+                "title": "Existing channel buttons",
+                "why": "Existing channel ke messages par URL buttons add, replace, ya clear karta hai. Originals/captions delete nahi hote.",
+                "usage": "/bulkbuttons <channel> Join | https://example.com; Support | https://t.me/example\nClear: /bulkbuttons <channel> clear",
             },
         ],
     },
@@ -2257,6 +2364,9 @@ def _reset_state_defaults():
         "auto_stats": {"sent": 0, "failed": 0, "duplicates": 0},
         "backup_channel": DEFAULT_BACKUP_CHANNEL,
         "backup_last_upload_epoch": 0,
+        "backup_last_attempt_epoch": 0,
+        "backup_last_upload_status": "never",
+        "backup_last_upload_error": "",
         "dedupe": {},
         "message_map": {},
         "oversized_messages": [],
@@ -2476,6 +2586,42 @@ async def _edit_channel_messages(channel_input, operation, value):
     return report
 
 
+async def _set_channel_buttons(channel_input, buttons):
+    """Add or replace URL buttons on every existing message in a channel."""
+    _channel, entity = await _resolve_bulk_channel(channel_input)
+    markup = _telegram_buttons({"custom_buttons": buttons}) or None
+    report = {
+        "channel": getattr(entity, "title", str(channel_input)),
+        "scanned": 0, "updated": 0, "skipped": 0, "failed": 0,
+        "errors": [],
+    }
+    operation_number = 0
+    async for message in client.iter_messages(entity, reverse=True):
+        report["scanned"] += 1
+        if not (message.text or message.media):
+            report["skipped"] += 1
+            continue
+        try:
+            operation_number += 1
+            await _bulk_api_call(
+                f"buttons message {message.id}",
+                lambda: client.edit_message(
+                    entity, message.id, reply_markup=markup
+                ),
+                operation_number,
+            )
+            report["updated"] += 1
+        except Exception as error:
+            report["failed"] += 1
+            report["errors"].append(f"{message.id}: {type(error).__name__}")
+        if report["scanned"] % 25 == 0:
+            _log_live(
+                f"🔘 Bulk buttons: {report['scanned']} scanned, "
+                f"{report['updated']} updated, {report['failed']} failed"
+            )
+    return report
+
+
 async def _reupload_video_thumbnails(channel_input, thumbnail_path):
     """Re-upload videos with a thumbnail; Telegram cannot edit an old thumbnail in place."""
     _channel, entity = await _resolve_bulk_channel(channel_input)
@@ -2532,6 +2678,11 @@ def _format_bulk_report(title, report):
             f"Changed: {report.get('changed', 0)}",
             f"Skipped: {report.get('skipped', 0)}",
         ])
+    if "updated" in report:
+        lines.extend([
+            f"Buttons updated: {report.get('updated', 0)}",
+            f"Skipped: {report.get('skipped', 0)}",
+        ])
     if "reuploaded" in report:
         lines.extend([
             f"Videos re-uploaded: {report.get('reuploaded', 0)}",
@@ -2558,6 +2709,21 @@ async def _reply_bulk_report(reply, title, operation, channel_input, value):
     await reply(text)
 
 
+async def _reply_bulk_buttons_report(reply, channel_input, buttons):
+    try:
+        report = await _set_channel_buttons(channel_input, buttons)
+        text = _format_bulk_report("Channel button operation complete", report)
+        if buttons:
+            text += "\nButtons: " + ", ".join(
+                f"{button['text']} → {button['url']}" for button in buttons
+            )
+        else:
+            text += "\nButtons cleared from existing messages."
+    except Exception as error:
+        text = f"❌ Channel button operation failed: {type(error).__name__}: {error}"
+    await reply(text)
+
+
 async def _reply_thumbnail_report(reply, channel_input, thumbnail_path):
     try:
         report = await _reupload_video_thumbnails(channel_input, thumbnail_path)
@@ -2577,6 +2743,44 @@ async def cmd_backup(event):
         "✅ Latest state backup Telegram channel mein upload ho gaya."
         if ok else "❌ Backup upload nahi ho saka. Logs check karo."
     )
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.buttons\s+(\S+)(?:\s+([\s\S]+))?$"))
+async def cmd_buttons(event):
+    if not is_owner(event.sender_id):
+        return
+    pair_id = event.pattern_match.group(1)
+    pair = _pair_by_id(pair_id)
+    if not pair:
+        await event.edit("❌ Pair ID nahi mila.")
+        return
+    raw = (event.pattern_match.group(2) or "").strip()
+    try:
+        buttons = [] if raw.lower() in {"off", "clear", "none"} else _parse_custom_buttons(raw, strict=True)
+    except ValueError as error:
+        await event.edit(f"❌ {error}\nFormat: `Label | https://example.com; Another | https://…`")
+        return
+    pair["custom_buttons"] = buttons
+    save_state(state)
+    await event.edit(
+        f"✅ {len(buttons)} forwarding button(s) saved for `{pair_id}`."
+        if buttons else f"✅ Forwarding buttons cleared for `{pair_id}`."
+    )
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.bulkbuttons\s+(\S+)(?:\s+([\s\S]+))?$"))
+async def cmd_bulkbuttons(event):
+    if not is_owner(event.sender_id):
+        return
+    channel_input = event.pattern_match.group(1)
+    raw = (event.pattern_match.group(2) or "").strip()
+    try:
+        buttons = [] if raw.lower() in {"off", "clear", "none"} else _parse_custom_buttons(raw, strict=True)
+    except ValueError as error:
+        await event.edit(f"❌ {error}\nFormat: `Label | https://example.com; Another | https://…`")
+        return
+    await event.edit("🔘 Existing channel messages ke buttons update ho rahe hain...")
+    asyncio.create_task(_reply_bulk_buttons_report(event.edit, channel_input, buttons))
 
 
 _pending_userbot_caption = {}
@@ -3165,6 +3369,59 @@ async def bot_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ Latest state backup upload ho gaya."
         if ok else "❌ Backup upload nahi ho saka. Logs check karo."
+    )
+
+
+async def bot_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /buttons <pair_id> Label | https://example.com; Another | https://…\n"
+            "Buttons clear karne ke liye: /buttons <pair_id> clear"
+        )
+        return
+    pair = _pair_by_id(context.args[0])
+    if not pair:
+        await update.message.reply_text("❌ Pair ID nahi mila.")
+        return
+    raw = " ".join(context.args[1:]).strip()
+    try:
+        buttons = [] if raw.lower() in {"off", "clear", "none"} else _parse_custom_buttons(raw, strict=True)
+    except ValueError as error:
+        await update.message.reply_text(
+            f"❌ {error}\nFormat: Label | https://example.com; Another | https://…"
+        )
+        return
+    pair["custom_buttons"] = buttons
+    save_state(state)
+    await update.message.reply_text(
+        f"✅ {len(buttons)} forwarding button(s) saved for {pair.get('name', pair['id'])}."
+        if buttons else f"✅ Forwarding buttons cleared for {pair.get('name', pair['id'])}."
+    )
+
+
+async def bot_bulkbuttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /bulkbuttons <channel> Label | https://example.com; Another | https://…\n"
+            "Existing buttons clear karne ke liye last argument `clear` use karo."
+        )
+        return
+    channel_input = context.args[0]
+    raw = " ".join(context.args[1:]).strip()
+    try:
+        buttons = [] if raw.lower() in {"off", "clear", "none"} else _parse_custom_buttons(raw, strict=True)
+    except ValueError as error:
+        await update.message.reply_text(
+            f"❌ {error}\nFormat: Label | https://example.com; Another | https://…"
+        )
+        return
+    await update.message.reply_text("🔘 Existing channel messages ke buttons update ho rahe hain...")
+    asyncio.create_task(
+        _reply_bulk_buttons_report(update.message.reply_text, channel_input, buttons)
     )
 
 
@@ -4085,6 +4342,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
     # Restricted or otherwise non-copyable messages fall back to the existing
     # disk-based path below.
     config = config or _pair_config(None)
+    buttons = _telegram_buttons(config)
     msg_type = get_msg_type(message)
     needs_rewrite = any([
         config["caption_prefix"], config["caption_suffix"],
@@ -4121,6 +4379,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                 caption=raw_text,
                 parse_mode=None,
                 formatting_entities=getattr(message, "entities", None),
+                buttons=buttons or None,
             )
         else:
             sent = await client.send_message(
@@ -4129,6 +4388,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                 parse_mode=None,
                 formatting_entities=getattr(message, "entities", None),
                 link_preview=False,
+                buttons=buttons or None,
             )
         logger.info(f"⚡ Copied directly msg_id={message.id} (no forward tag)")
         return sent or True
@@ -4187,6 +4447,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                     force_document=False,
                     part_size_kb=1024,
                     progress_callback=ul_cb,
+                    buttons=buttons or None,
                 )
             elif is_video:
                 # Video as streamable video (not document)
@@ -4199,6 +4460,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                     attributes=attributes,  # original duration/dimensions preserve
                     part_size_kb=1024,
                     progress_callback=ul_cb,
+                    buttons=buttons or None,
                 )
             elif is_audio:
                 # Audio as audio player
@@ -4209,6 +4471,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                     attributes=attributes,  # title/duration preserve
                     part_size_kb=1024,
                     progress_callback=ul_cb,
+                    buttons=buttons or None,
                 )
             else:
                 # PDF, CSV, ZIP, etc — document as document
@@ -4219,6 +4482,7 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                     attributes=attributes,
                     part_size_kb=1024,
                     progress_callback=ul_cb,
+                    buttons=buttons or None,
                 )
         finally:
             try:
@@ -4231,7 +4495,8 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
     elif message.text:
         sent = await client.send_message(
             target, caption if "caption" in locals() else _edited_caption(message, config, source_title),
-            parse_mode=_parse_mode(config), link_preview=False
+            parse_mode=_parse_mode(config), link_preview=False,
+            buttons=buttons or None,
         )
         return sent or True
 
@@ -4527,6 +4792,7 @@ async def _create_pair(payload):
     template_error = _caption_template_error(caption_template)
     if template_error:
         raise ValueError(template_error)
+    custom_buttons = _parse_custom_buttons(payload.get("custom_buttons"), strict=True)
     pair = {
         "id": uuid.uuid4().hex[:8],
         "name": str(payload.get("name") or "Pair"),
@@ -4563,6 +4829,7 @@ async def _create_pair(payload):
         "caption_parse_mode": str(payload.get("caption_parse_mode", "md")),
         "thumbnail_enabled": bool(payload.get("thumbnail_enabled", False)),
         "thumbnail_path": "",
+        "custom_buttons": custom_buttons,
     }
     state.setdefault("pairs", []).append(pair)
     save_state(state)
@@ -4772,6 +5039,12 @@ def _status_payload():
             "backup_file": STATE_BACKUP_FILE,
             "database_file": STATE_DB_FILE,
             "backup_available": Path(STATE_BACKUP_FILE).exists(),
+            "backup_interval_seconds": BACKUP_INTERVAL_SECONDS,
+            "backup_status": state.get("backup_last_upload_status", "never"),
+            "backup_last_upload_epoch": state.get("backup_last_upload_epoch", 0),
+            "backup_last_attempt_epoch": state.get("backup_last_attempt_epoch", 0),
+            "backup_last_error": state.get("backup_last_upload_error", ""),
+            "backup_last_message_id": state.get("backup_last_upload_message_id"),
         },
         "backup_channel": state.get("backup_channel", DEFAULT_BACKUP_CHANNEL),
         "pair_health": state.get("health", {}),
@@ -4963,6 +5236,13 @@ def api_delete_pair(pair_id):
             template_error = _caption_template_error(str(payload.get("caption_template", "")))
             if template_error:
                 return jsonify({"ok": False, "error": template_error}), 400
+        if "custom_buttons" in payload:
+            try:
+                payload["custom_buttons"] = _parse_custom_buttons(
+                    payload.get("custom_buttons"), strict=True
+                )
+            except ValueError as exc:
+                return jsonify({"ok": False, "error": str(exc)}), 400
         if "source" in payload or "target" in payload:
             try:
                 source, target, source_entity, target_entity = _run_async(
@@ -4987,7 +5267,7 @@ def api_delete_pair(pair_id):
                     "schedule_start", "schedule_end", "quiet_start", "quiet_end",
                      "protected_behavior", "caption_enabled", "caption_template",
                      "caption_types", "caption_parse_mode", "thumbnail_enabled",
-                     "batch_id"):
+                     "batch_id", "custom_buttons"):
             if key in payload:
                 if key == "batch_id":
                     if not _batch_by_id(str(payload[key])):
@@ -5551,6 +5831,8 @@ async def main():
     app.add_handler(CommandHandler("tasks", bot_tasks))
     app.add_handler(CommandHandler("autoforward", bot_autoforward))
     app.add_handler(CommandHandler("backup", bot_backup))
+    app.add_handler(CommandHandler("buttons", bot_buttons))
+    app.add_handler(CommandHandler("bulkbuttons", bot_bulkbuttons))
     app.add_handler(CommandHandler("caption", bot_caption))
     app.add_handler(CommandHandler("setthumbnail", bot_setthumbnail))
     app.add_handler(CommandHandler("editcaptions", bot_editcaptions))
@@ -5569,6 +5851,7 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     asyncio.create_task(health_monitor())
+    asyncio.create_task(backup_scheduler())
 
     await client.run_until_disconnected()
 
