@@ -50,6 +50,8 @@ copied:
 - Stable text identity.
 - Telegram document/photo metadata fingerprint.
 - Pair-specific dedupe records.
+- A complete target-channel analysis at the start of every sync, including
+  messages copied before the latest local state backup.
 
 The dashboard also provides a **Copy again** action that clears dedupe
 identities for a selected pair.
@@ -449,10 +451,11 @@ media limits. Large videos can require significant temporary disk space.
 
 ### Thumbnail operation does not change old posts
 
-This is expected: Telegram does not safely edit an existing video's thumbnail
-in place. The bulk command creates replacement posts and keeps originals.
-Confirm that the replied file is a valid image and that the target account can
-post videos.
+Telegram does not safely edit an existing video's thumbnail in place. The bulk
+command therefore downloads and re-uploads replacement posts with the new
+thumbnail and keeps originals. Thumbnail replacements are not blocked by the
+normal 1.8 GB sync working-budget preflight; the operation still needs enough
+actual temporary disk space for one video at a time.
 
 ### Caption template error
 

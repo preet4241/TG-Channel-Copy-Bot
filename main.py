@@ -447,6 +447,7 @@ state.setdefault("message_map", {})
 state.setdefault("media_fingerprints", {})
 state.setdefault("pair_health", {})
 state.setdefault("oversized_messages", [])
+state.setdefault("target_scan", {})
 state.setdefault("templates", {})
 state.setdefault("batches", [])
 state.setdefault("notification_settings", {
@@ -832,6 +833,118 @@ def _strong_dedupe_key(pair_id, message):
     return f"{pair_id}:text:{hashlib.sha256(text.encode()).hexdigest()}"
 
 
+def _target_identity_keys(message):
+    """Return identities that survive a stop/restart and Telegram re-upload."""
+    keys = set()
+    text = re.sub(r"\s+", " ", (getattr(message, "text", "") or "").strip().lower())
+    media = getattr(message, "media", None)
+    document = getattr(media, "document", None)
+    if document:
+        filename = next(
+            (
+                attribute.file_name
+                for attribute in (getattr(document, "attributes", None) or [])
+                if isinstance(attribute, DocumentAttributeFilename)
+            ),
+            "",
+        )
+        video = next(
+            (
+                attribute
+                for attribute in (getattr(document, "attributes", None) or [])
+                if isinstance(attribute, DocumentAttributeVideo)
+            ),
+            None,
+        )
+        shape = (
+            f"{getattr(document, 'size', 0) or 0}:"
+            f"{getattr(document, 'mime_type', '') or ''}:"
+            f"{filename}:"
+            f"{getattr(video, 'duration', '') if video else ''}:"
+            f"{getattr(video, 'w', '') if video else ''}:"
+            f"{getattr(video, 'h', '') if video else ''}"
+        )
+        keys.add(f"target-media-shape:{shape}")
+        document_id = getattr(document, "id", None)
+        if document_id:
+            keys.add(
+                "target-media-exact:"
+                f"{document_id}:{getattr(document, 'size', 0) or 0}:"
+                f"{filename}:{getattr(document, 'mime_type', '') or ''}"
+            )
+        if text:
+            keys.add(
+                "target-media-caption:"
+                f"{hashlib.sha256(f'{text}|{shape}'.encode()).hexdigest()}"
+            )
+        return keys
+
+    photo = getattr(media, "photo", None)
+    if photo:
+        photo_id = getattr(photo, "id", None)
+        if photo_id:
+            keys.add(f"target-photo-exact:{photo_id}")
+        sizes = getattr(photo, "sizes", None) or []
+        largest = max(
+            sizes,
+            key=lambda item: (getattr(item, "w", 0) or 0) * (getattr(item, "h", 0) or 0),
+            default=None,
+        )
+        photo_shape = (
+            f"{getattr(largest, 'w', '') if largest else ''}:"
+            f"{getattr(largest, 'h', '') if largest else ''}"
+        )
+        keys.add(f"target-photo-shape:{photo_shape}")
+        if text:
+            keys.add(
+                "target-photo-caption:"
+                f"{hashlib.sha256(f'{text}|{photo_shape}'.encode()).hexdigest()}"
+            )
+        return keys
+
+    if text:
+        keys.add(f"target-text:{hashlib.sha256(text.encode()).hexdigest()}")
+    return keys
+
+
+async def _analyse_target_channel(target_entity, pair_id, edit_msg):
+    """Inventory the complete target before a sync is allowed to send."""
+    target_index = set()
+    scanned = 0
+    state["source_status"] = "Analyzing target"
+    state["target_scan"] = {
+        "status": "running",
+        "pair_id": str(pair_id),
+        "scanned": 0,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_state(state)
+    _log_live("🔎 Target channel analysis started before sync")
+    await edit_msg(
+        "🔎 Sync se pehle target channel ka pura data analyze ho raha hai...\n"
+        "Existing messages ko dobara send nahi kiya jayega."
+    )
+    async for target_message in client.iter_messages(target_entity, reverse=True):
+        scanned += 1
+        target_index.update(_target_identity_keys(target_message))
+        if scanned % 100 == 0:
+            state["target_scan"]["scanned"] = scanned
+            _dashboard_changed()
+            await edit_msg(
+                "🔎 Target channel analyze ho raha hai...\n"
+                f"Messages checked: {scanned}"
+            )
+    state["target_scan"].update({
+        "status": "complete",
+        "scanned": scanned,
+        "completed_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    state["source_status"] = "Target analyzed"
+    save_state(state)
+    _log_live(f"✅ Target channel analysis complete: {scanned} messages checked")
+    return target_index
+
+
 def _time_in_window(now, start, end):
     if not start or not end:
         return False
@@ -975,7 +1088,13 @@ async def send_album(target, messages, on_progress=None, config=None,
     paths = []
     try:
         for message in messages:
-            path = await fast_download(message.media)
+            path = await fast_download(
+                message.media,
+                enforce_storage_limit=not (
+                    config.get("thumbnail_enabled")
+                    and get_msg_type(message) == "video"
+                ),
+            )
             if path and Path(path).exists():
                 paths.append(path)
         if len(paths) != len(messages):
@@ -1405,7 +1524,11 @@ def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
     return task
 
 # ─── DISK-BASED DOWNLOADER (RAM bachane ke liye) ──────
-async def fast_download(media, progress_cb=None) -> str:
+async def fast_download(
+    media,
+    progress_cb=None,
+    enforce_storage_limit=True,
+) -> str:
     """
     File ko RAM mein nahi, disk (/tmp) pe download karta hai.
     Returns: tmp file path (str). Caller ka zimma hai delete karna.
@@ -1415,7 +1538,11 @@ async def fast_download(media, progress_cb=None) -> str:
     if isinstance(media, MessageMediaDocument) and media.document:
         total_size = media.document.size or 0
     snapshot = _storage_snapshot()
-    if total_size and total_size > snapshot["available_bytes"]:
+    if (
+        enforce_storage_limit
+        and total_size
+        and total_size > snapshot["available_bytes"]
+    ):
         raise StorageLimitError(
             f"Temporary storage limit reached: need {total_size / 1048576:.1f} MB, "
             f"available {snapshot['available_mb']:.1f} MB",
@@ -2638,7 +2765,12 @@ async def _reupload_video_thumbnails(channel_input, thumbnail_path):
             continue
         video_path = None
         try:
-            video_path = await fast_download(message.media)
+            video_path = await fast_download(
+                message.media,
+                enforce_storage_limit=False,
+            )
+            document = getattr(message.media, "document", None)
+            attributes = getattr(document, "attributes", None) or None
             operation_number += 1
             await _bulk_api_call(
                 f"thumbnail message {message.id}",
@@ -2647,6 +2779,8 @@ async def _reupload_video_thumbnails(channel_input, thumbnail_path):
                     video_path,
                     thumb=str(thumbnail_path),
                     caption=message.text or "",
+                    formatting_entities=getattr(message, "entities", None),
+                    attributes=attributes,
                     supports_streaming=True,
                     force_document=False,
                 ),
@@ -3642,6 +3776,9 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
     try:
         source_entity = await client.get_entity(source)
         target_entity = await client.get_entity(target)
+        target_index = await _analyse_target_channel(
+            target_entity, pair_id, edit_msg
+        )
 
         pair_limit = config.get("max_messages", MAX_TASK_MESSAGES)
         effective_limit = min(limit, pair_limit) if limit else pair_limit
@@ -3672,7 +3809,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
         _log_live(f"🚀 Sync shuru | {src_title} → {tgt_title} | {total_count} messages")
 
         await edit_msg(
-            f"⚡ Sync शुरू हो गया!\n\n"
+            f"⚡ Target analysis complete. Sync शुरू हो गया!\n\n"
             f"📥 Source: {src_title}\n"
             f"📤 Target: {tgt_title}\n"
             f"📊 Total: {total_count} messages\n\n"
@@ -3836,7 +3973,9 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                     handled_albums.add(grouped_id)
                     album = [item for item in album if _message_allowed(item, config)]
                     duplicate_album_items = [
-                        item for item in album if _is_duplicate(pair_id, item)
+                        item for item in album
+                        if _is_duplicate(pair_id, item)
+                        or bool(_target_identity_keys(item) & target_index)
                     ]
                     if duplicate_album_items:
                         stats["duplicates"] = stats.get("duplicates", 0) + len(duplicate_album_items)
@@ -3912,6 +4051,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                             sent_item = sent_album[min(index, len(sent_album) - 1)] if sent_album else None
                             _remember_mapping(pair_id, item.id, sent_item)
                             _record_dedupe(pair_id, item)
+                            target_index.update(_target_identity_keys(item))
                             stats[get_msg_type(item)] = stats.get(get_msg_type(item), 0) + 1
                             if not force_sync:
                                 _daily_budget(
@@ -3939,11 +4079,15 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                 continue
             dedupe = state.setdefault("dedupe", {})
             dkey = _dedupe_key(pair_id, message)
-            if _is_duplicate(pair_id, message):
+            target_match = bool(_target_identity_keys(message) & target_index)
+            if _is_duplicate(pair_id, message) or target_match:
                 stats["duplicates"] = stats.get("duplicates", 0) + 1
+                if target_match:
+                    _record_dedupe(pair_id, message)
                 state["stats"] = stats
                 _dashboard_changed()
-                _log_live(f"⏭️ Duplicate skipped ID={message.id}")
+                reason = "target mein pehle se maujood" if target_match else "state mein recorded"
+                _log_live(f"⏭️ Duplicate skipped ID={message.id} ({reason})")
                 continue
             budget_ok, budget_bucket, permanently_oversized = (
                 (True, None, False)
@@ -4401,7 +4545,13 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
             if on_progress:
                 await on_progress("download", current, total)
 
-        tmp_path = await fast_download(message.media, progress_cb=dl_cb if on_progress else None)
+        tmp_path = await fast_download(
+            message.media,
+            progress_cb=dl_cb if on_progress else None,
+            enforce_storage_limit=not (
+                config.get("thumbnail_enabled") and msg_type == "video"
+            ),
+        )
         if not tmp_path or not Path(tmp_path).exists():
             raise Exception("Media download failed")
 

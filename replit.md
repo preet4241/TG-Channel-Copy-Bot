@@ -42,5 +42,10 @@ replied caption message or ask for it in the next message; `/cancel` and
 Bulk edits wait 3 seconds per Telegram action, pause 10 seconds after each
 10 actions, honor FloodWait/SlowMode server waits, and retry limited actions
 up to three times.
-Video thumbnails require re-uploading because Telegram does not edit an
-existing media thumbnail in place; originals are retained.
+Every sync first scans the complete target channel and builds a media/text
+identity index, so a restart cannot resend posts that already reached the
+target even when the local state backup stopped halfway through. Video
+thumbnails require re-uploading because Telegram does not edit an existing
+media thumbnail in place; originals are retained. Thumbnail replacement skips
+the normal 1.8 GB sync preflight and uses one temporary video at a time, so
+large videos are only limited by actual available temporary disk space.
