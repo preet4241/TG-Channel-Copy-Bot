@@ -27,6 +27,7 @@ import secrets
 import shutil
 import mimetypes
 import sqlite3
+from logging.handlers import RotatingFileHandler
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -241,7 +242,12 @@ logger = logging.getLogger("SyncBot")
 logger.setLevel(logging.DEBUG)
 _fmt = logging.Formatter("[%(asctime)s] %(levelname)s — %(message)s", "%d-%b %H:%M:%S")
 
-_fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_fh = RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=10 * 1024 * 1024,
+    backupCount=3,
+    encoding="utf-8",
+)
 _fh.setLevel(logging.DEBUG)
 _fh.setFormatter(_fmt)
 
@@ -260,6 +266,21 @@ def _log_live(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     _live_log.append(f"[{ts}] {msg}")
     _dashboard_changed()
+
+
+def _log_operation(level, event, phase="runtime", **context):
+    """Write a searchable, context-rich event to file, console, and dashboard."""
+    safe_context = {}
+    for key, value in context.items():
+        if value is None:
+            continue
+        text = str(value).replace("\n", " ").replace("\r", " ")
+        safe_context[key] = text[:500]
+    payload = {"event": event, "phase": phase, **safe_context}
+    message = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    log_method = getattr(logger, str(level).lower(), logger.info)
+    log_method(message)
+
 
 class _LiveLogHandler(logging.Handler):
     """Mirror every logger record into _live_log for the web dashboard."""
@@ -529,6 +550,12 @@ def _ensure_state_defaults_after_restore():
 async def restore_latest_backup():
     """Restore the newest JSON state file from the configured Telegram channel."""
     backup_channel = state.get("backup_channel", DEFAULT_BACKUP_CHANNEL)
+    _log_operation(
+        "info",
+        "State backup restore started",
+        phase="backup",
+        channel=backup_channel,
+    )
     try:
         entity = await client.get_entity(backup_channel)
         messages = await client.get_messages(entity, limit=50)
@@ -564,10 +591,25 @@ async def restore_latest_backup():
         _ensure_state_defaults_after_restore()
         save_state(state)
         logger.info("Restored latest Telegram backup from message %s", candidates[0].id)
+        _log_operation(
+            "info",
+            "State backup restored",
+            phase="backup",
+            channel=backup_channel,
+            message_id=candidates[0].id,
+        )
         _log_live(f"♻️ Restored latest state backup from Telegram (message {candidates[0].id})")
         return True
     except Exception as exc:
         logger.warning("Telegram backup restore skipped: %s", exc)
+        _log_operation(
+            "warning",
+            "State backup restore skipped",
+            phase="backup",
+            channel=backup_channel,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         return False
     finally:
         try:
@@ -582,8 +624,22 @@ async def upload_state_backup(force=False):
         now = time.time()
         last_upload = float(state.get("backup_last_upload_epoch", 0) or 0)
         if not force and now - last_upload < BACKUP_INTERVAL_SECONDS:
+            _log_operation(
+                "debug",
+                "State backup upload skipped by interval",
+                phase="backup",
+                force=force,
+                age_seconds=round(now - last_upload, 1),
+            )
             return False
         backup_channel = state.get("backup_channel", DEFAULT_BACKUP_CHANNEL)
+        _log_operation(
+            "info",
+            "State backup upload started",
+            phase="backup",
+            channel=backup_channel,
+            force=force,
+        )
         state["backup_last_attempt_epoch"] = now
         state["backup_last_upload_status"] = "uploading"
         state["backup_last_upload_error"] = ""
@@ -613,6 +669,13 @@ async def upload_state_backup(force=False):
             state["backup_last_upload_error"] = ""
             state["backup_last_upload_message_id"] = getattr(sent, "id", None)
             save_state(state)
+            _log_operation(
+                "info",
+                "State backup uploaded",
+                phase="backup",
+                channel=backup_channel,
+                message_id=getattr(sent, "id", None),
+            )
             _log_live(f"💾 State backup uploaded to Telegram channel {backup_channel}")
             return True
         except Exception as exc:
@@ -623,6 +686,14 @@ async def upload_state_backup(force=False):
             except Exception:
                 logger.exception("Could not persist backup failure status")
             logger.warning("Telegram state backup upload failed: %s", exc)
+            _log_operation(
+                "error",
+                "State backup upload failed",
+                phase="backup",
+                channel=backup_channel,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             _log_live(f"⚠️ Backup upload failed: {type(exc).__name__}")
             return False
 
@@ -919,6 +990,13 @@ async def _analyse_target_channel(target_entity, pair_id, edit_msg):
         "started_at": datetime.now().isoformat(timespec="seconds"),
     }
     save_state(state)
+    _log_operation(
+        "info",
+        "Target analysis started",
+        phase="target_scan",
+        pair_id=pair_id,
+        target=getattr(target_entity, "title", str(target_entity)),
+    )
     _log_live("🔎 Target channel analysis started before sync")
     await edit_msg(
         "🔎 Sync se pehle target channel ka pura data analyze ho raha hai...\n"
@@ -941,6 +1019,15 @@ async def _analyse_target_channel(target_entity, pair_id, edit_msg):
     })
     state["source_status"] = "Target analyzed"
     save_state(state)
+    _log_operation(
+        "info",
+        "Target analysis finished",
+        phase="target_scan",
+        pair_id=pair_id,
+        target=getattr(target_entity, "title", str(target_entity)),
+        scanned=scanned,
+        identities=len(target_index),
+    )
     _log_live(f"✅ Target channel analysis complete: {scanned} messages checked")
     return target_index
 
@@ -1192,9 +1279,24 @@ def _caption_template_error(template):
 
 async def _bulk_api_call(label, operation, operation_number):
     """Run one bulk Telegram API action with pacing and limit-aware retries."""
+    _log_operation(
+        "debug",
+        "Bulk action started",
+        phase="bulk",
+        action=label,
+        operation_number=operation_number,
+    )
     for attempt in range(4):
         try:
             result = await operation()
+            _log_operation(
+                "debug",
+                "Bulk action finished",
+                phase="bulk",
+                action=label,
+                operation_number=operation_number,
+                attempt=attempt + 1,
+            )
             await asyncio.sleep(MSG_DELAY)
             if operation_number and operation_number % BATCH_SIZE == 0:
                 _log_live(
@@ -1206,7 +1308,27 @@ async def _bulk_api_call(label, operation, operation_number):
         except (FloodWaitError, SlowModeWaitError) as error:
             wait_seconds = max(int(getattr(error, "seconds", 30) or 30), 1)
             if attempt >= 3:
+                _log_operation(
+                    "error",
+                    "Bulk action exhausted retries",
+                    phase="bulk",
+                    action=label,
+                    operation_number=operation_number,
+                    attempts=attempt + 1,
+                    wait_seconds=wait_seconds,
+                    error_type=type(error).__name__,
+                )
                 raise
+            _log_operation(
+                "warning",
+                "Bulk action waiting for Telegram limit",
+                phase="bulk",
+                action=label,
+                operation_number=operation_number,
+                attempt=attempt + 1,
+                wait_seconds=wait_seconds,
+                error_type=type(error).__name__,
+            )
             _log_live(
                 f"⏳ Telegram limit for bulk {label}: waiting "
                 f"{wait_seconds}s before retry {attempt + 1}/3"
@@ -1365,6 +1487,17 @@ async def _task_worker():
                 for item in state.get("tasks", [])
             ]
             save_state(state)
+            _log_operation(
+                "info",
+                "Task started",
+                phase="task",
+                task_id=task["id"],
+                mode=task.get("mode"),
+                pair_id=task.get("pair_id"),
+                source=task.get("source_title", task.get("source")),
+                target=task.get("target_title", task.get("target")),
+                queue_size=len(_task_queue),
+            )
             _log_live(f"📋 Task {task['id']} started ({task['mode']})")
             try:
                 await _run_sync(
@@ -1436,11 +1569,31 @@ async def _task_worker():
                         ]]) if task["status"] == "paused" else None
                     )
                     await _notify_owner(message, reply_markup=markup)
+                _log_operation(
+                    "info" if task["status"] in {"complete", "partial", "paused"} else "error",
+                    "Task finished",
+                    phase="task",
+                    task_id=task["id"],
+                    status=task["status"],
+                    current=task.get("current"),
+                    total=task.get("total"),
+                    scanned=task.get("scanned"),
+                    failed=task.get("stats", {}).get("failed", 0),
+                    duplicates=task.get("stats", {}).get("duplicates", 0),
+                    pause_reason=task.get("pause_reason"),
+                    error=task.get("error"),
+                )
     finally:
         _task_worker_running = False
         state["running"] = bool(_task_queue)
         state.pop("active_task_id", None)
         save_state(state)
+        _log_operation(
+            "info",
+            "Task worker idle",
+            phase="task",
+            queued_tasks=len(_task_queue),
+        )
 
 
 def _resume_paused_task(task):
@@ -1515,6 +1668,22 @@ def _queue_sync(source, target, reverse=True, min_id=0, limit=None,
     _task_queue.extend(ordered)
     state["tasks"] = state.get("tasks", []) + [_task_view(task)]
     save_state(state)
+    _log_operation(
+        "info",
+        "Sync task queued",
+        phase="task",
+        task_id=task["id"],
+        mode=mode,
+        pair_id=pair_id,
+        source=task["source_title"],
+        target=task["target_title"],
+        min_id=min_id,
+        max_id=task.get("max_id", 0),
+        limit=limit,
+        priority=priority,
+        force_sync=force_sync,
+        queue_size=len(_task_queue),
+    )
     # Web routes run in Flask's thread, while bot commands run on Telegram's
     # event-loop thread. Always schedule the worker on the shared loop.
     if _loop is not None and _loop.is_running():
@@ -1572,7 +1741,14 @@ async def fast_download(
     downloaded = [0]
     _last_cb   = [0.0]
 
-    logger.debug(f"Disk download → {tmp_path} | size={total_size//1024}KB")
+    _log_operation(
+        "debug",
+        "Media download started",
+        phase="media",
+        size_bytes=total_size,
+        storage_limit_enforced=enforce_storage_limit,
+        path=tmp_path,
+    )
 
     async def _progress(current, total):
         downloaded[0] = current
@@ -1582,8 +1758,28 @@ async def fast_download(
                 _last_cb[0] = now
                 await progress_cb(current, total or total_size)
 
-    await client.download_media(media, file=tmp_path, progress_callback=_progress)
-    return tmp_path
+    try:
+        await client.download_media(media, file=tmp_path, progress_callback=_progress)
+        _log_operation(
+            "debug",
+            "Media download finished",
+            phase="media",
+            size_bytes=total_size,
+            path=tmp_path,
+        )
+        return tmp_path
+    except Exception as exc:
+        _log_operation(
+            "error",
+            "Media download failed",
+            phase="media",
+            error_type=type(exc).__name__,
+            error=str(exc),
+            size_bytes=total_size,
+            path=tmp_path,
+        )
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
 # ──────────────────────────────────────────────────────
 
 
@@ -2667,6 +2863,13 @@ def _bulk_caption_text(message, template):
 async def _edit_channel_messages(channel_input, operation, value):
     """Edit existing messages in place and return an operational report."""
     _channel, entity = await _resolve_bulk_channel(channel_input)
+    _log_operation(
+        "info",
+        "Bulk channel edit started",
+        phase="bulk",
+        operation=operation,
+        channel=getattr(entity, "title", str(channel_input)),
+    )
     report = {
         "channel": getattr(entity, "title", str(channel_input)),
         "scanned": 0, "changed": 0, "skipped": 0, "failed": 0,
@@ -2716,6 +2919,13 @@ async def _edit_channel_messages(channel_input, operation, value):
 async def _set_channel_buttons(channel_input, buttons):
     """Add or replace URL buttons on every existing message in a channel."""
     _channel, entity = await _resolve_bulk_channel(channel_input)
+    _log_operation(
+        "info",
+        "Bulk button update started",
+        phase="bulk",
+        channel=getattr(entity, "title", str(channel_input)),
+        button_count=len(buttons),
+    )
     markup = _telegram_buttons({"custom_buttons": buttons}) or None
     report = {
         "channel": getattr(entity, "title", str(channel_input)),
@@ -2752,6 +2962,13 @@ async def _set_channel_buttons(channel_input, buttons):
 async def _reupload_video_thumbnails(channel_input, thumbnail_path):
     """Re-upload videos with a thumbnail; Telegram cannot edit an old thumbnail in place."""
     _channel, entity = await _resolve_bulk_channel(channel_input)
+    _log_operation(
+        "info",
+        "Thumbnail replacement started",
+        phase="thumbnail",
+        channel=getattr(entity, "title", str(channel_input)),
+        thumbnail=thumbnail_path,
+    )
     report = {
         "channel": getattr(entity, "title", str(channel_input)),
         "scanned": 0, "reuploaded": 0, "skipped": 0, "failed": 0,
@@ -2787,9 +3004,26 @@ async def _reupload_video_thumbnails(channel_input, thumbnail_path):
                 operation_number,
             )
             report["reuploaded"] += 1
+            _log_operation(
+                "info",
+                "Thumbnail replacement succeeded",
+                phase="thumbnail",
+                channel=getattr(entity, "title", str(channel_input)),
+                message_id=message.id,
+                reuploaded=report["reuploaded"],
+            )
         except Exception as error:
             report["failed"] += 1
             report["errors"].append(f"{message.id}: {type(error).__name__}")
+            _log_operation(
+                "error",
+                "Thumbnail replacement failed",
+                phase="thumbnail",
+                channel=getattr(entity, "title", str(channel_input)),
+                message_id=message.id,
+                error_type=type(error).__name__,
+                error=str(error),
+            )
         finally:
             if video_path:
                 Path(video_path).unlink(missing_ok=True)
@@ -2798,6 +3032,16 @@ async def _reupload_video_thumbnails(channel_input, thumbnail_path):
                 f"🖼️ Video thumbnail: {report['scanned']} scanned, "
                 f"{report['reuploaded']} reuploaded, {report['failed']} failed"
             )
+    _log_operation(
+        "info" if not report["failed"] else "warning",
+        "Thumbnail replacement finished",
+        phase="thumbnail",
+        channel=report["channel"],
+        scanned=report["scanned"],
+        reuploaded=report["reuploaded"],
+        skipped=report["skipped"],
+        failed=report["failed"],
+    )
     return report
 
 
@@ -3037,7 +3281,17 @@ async def cmd_videothumbnail(event):
 # ════════════════════════════════════════════════════════
 
 def bot_is_owner(update: Update) -> bool:
-    return update.effective_user.id == OWNER_ID
+    user = update.effective_user
+    allowed = bool(user and user.id == OWNER_ID)
+    if not allowed:
+        _log_operation(
+            "warning",
+            "Unauthorized bot command rejected",
+            phase="auth",
+            user_id=getattr(user, "id", None),
+            command=getattr(getattr(update, "message", None), "text", "")[:120],
+        )
+    return allowed
 
 async def bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
@@ -3776,6 +4030,15 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
     try:
         source_entity = await client.get_entity(source)
         target_entity = await client.get_entity(target)
+        _log_operation(
+            "info",
+            "Sync channels resolved",
+            phase="sync",
+            task_id=task_id,
+            pair_id=pair_id,
+            source=src_title,
+            target=tgt_title,
+        )
         target_index = await _analyse_target_channel(
             target_entity, pair_id, edit_msg
         )
@@ -3806,6 +4069,21 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
 
         start_time = time.time()
         logger.info(f"Sync started | src={src_title} | tgt={tgt_title} | total={total_count}")
+        _log_operation(
+            "info",
+            "Sync transfer started",
+            phase="sync",
+            task_id=task_id,
+            pair_id=pair_id,
+            source=src_title,
+            target=tgt_title,
+            total=total_count,
+            reverse=reverse,
+            min_id=min_id,
+            max_id=max_id,
+            limit=limit,
+            force_sync=force_sync,
+        )
         _log_live(f"🚀 Sync shuru | {src_title} → {tgt_title} | {total_count} messages")
 
         await edit_msg(
@@ -4429,6 +4707,21 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             f"🏁 Sync complete! ✅ {count} sent  ❌ {failed} failed  "
             f"⏱ {_fmt_eta(elapsed_total)}"
         )
+        _log_operation(
+            "info" if not failed else "warning",
+            "Sync transfer finished",
+            phase="sync",
+            task_id=task_id,
+            pair_id=pair_id,
+            source=src_title,
+            target=tgt_title,
+            sent=count,
+            failed=failed,
+            scanned=scanned,
+            duplicates=stats.get("duplicates", 0),
+            skipped=stats.get("skipped", 0),
+            elapsed_seconds=round(elapsed_total, 2),
+        )
         logger.info(
             f"Sync complete | sent={count} failed={failed} "
             f"time={_fmt_eta(elapsed_total)}"
@@ -4466,6 +4759,16 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
 
     except ChannelPrivateError:
         logger.error("ChannelPrivateError — source is private or no access")
+        _log_operation(
+            "error",
+            "Sync failed because source is inaccessible",
+            phase="sync",
+            task_id=task_id,
+            pair_id=pair_id,
+            source=src_title,
+            target=tgt_title,
+            error_type="ChannelPrivateError",
+        )
         state["_task_failed_reason"] = "Source channel is private or inaccessible"
         state["running"] = False
         save_state(state)
@@ -4473,6 +4776,17 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
 
     except Exception as e:
         logger.error(f"Fatal sync error: {e}")
+        _log_operation(
+            "error",
+            "Sync failed",
+            phase="sync",
+            task_id=task_id,
+            pair_id=pair_id,
+            source=src_title,
+            target=tgt_title,
+            error_type=type(e).__name__,
+            error=str(e),
+        )
         state["_task_failed_reason"] = f"{type(e).__name__}: {e}"
         state["running"] = False
         save_state(state)
@@ -4535,9 +4849,26 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
                 buttons=buttons or None,
             )
         logger.info(f"⚡ Copied directly msg_id={message.id} (no forward tag)")
+        _log_operation(
+            "debug",
+            "Media copied directly",
+            phase="media",
+            message_id=message.id,
+            message_type=msg_type,
+            target=getattr(target, "title", str(target)),
+        )
         return sent or True
     except Exception as copy_error:
         logger.debug(f"Direct copy unavailable for msg_id={message.id}: {copy_error}")
+        _log_operation(
+            "debug",
+            "Direct media copy unavailable; using upload path",
+            phase="media",
+            message_id=message.id,
+            message_type=msg_type,
+            error_type=type(copy_error).__name__,
+            error=str(copy_error),
+        )
 
     if message.media and not isinstance(message.media, MessageMediaWebPage):
 
@@ -4582,7 +4913,18 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
             send_path.rename(named_path)
             send_path = named_path
 
-        logger.debug(f"Uploading {send_path.stat().st_size//1024}KB | mime={mime} | file={send_path.name}")
+        upload_size = send_path.stat().st_size
+        _log_operation(
+            "info",
+            "Media upload started",
+            phase="media",
+            message_id=message.id,
+            message_type=msg_type,
+            size_bytes=upload_size,
+            mime=mime,
+            thumbnail=bool(_thumbnail_path(config)) if is_video else False,
+            target=getattr(target, "title", str(target)),
+        )
 
         async def ul_cb(current, total):
             if on_progress:
@@ -4640,6 +4982,15 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
             except Exception:
                 pass
 
+        _log_operation(
+            "info",
+            "Media upload finished",
+            phase="media",
+            message_id=message.id,
+            message_type=msg_type,
+            size_bytes=upload_size,
+            target=getattr(target, "title", str(target)),
+        )
         return sent or True
 
     elif message.text:
@@ -4817,8 +5168,21 @@ async def _notify_owner(text, reply_markup=None):
             await _bot_application.bot.send_message(
                 chat_id=OWNER_ID, text=text, reply_markup=reply_markup
             )
+            _log_operation(
+                "debug",
+                "Owner notification sent",
+                phase="notification",
+                preview=text[:160],
+            )
         except Exception as exc:
             logger.warning("Owner alert failed: %s", exc)
+            _log_operation(
+                "error",
+                "Owner notification failed",
+                phase="notification",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
 
 
 async def health_monitor():
@@ -4836,12 +5200,30 @@ async def health_monitor():
                 health["protected"] = bool(getattr(source, "noforwards", False))
             except Exception as exc:
                 health["last_error"] = f"source: {type(exc).__name__}"
+                _log_operation(
+                    "warning",
+                    "Health check source failed",
+                    phase="health",
+                    pair_id=pair.get("id"),
+                    source=pair.get("source"),
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
             try:
                 target = await client.get_entity(pair["target"])
                 health["target_writable"] = not bool(getattr(target, "default_banned_rights", None)
                                                      and getattr(target.default_banned_rights, "send_messages", False))
             except Exception as exc:
                 health["last_error"] = f"target: {type(exc).__name__}"
+                _log_operation(
+                    "warning",
+                    "Health check target failed",
+                    phase="health",
+                    pair_id=pair.get("id"),
+                    target=pair.get("target"),
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
             snapshot[str(pair["id"])] = health
         connected = client.is_connected()
         snapshot["login"] = "ok" if connected else "offline"
@@ -4865,6 +5247,14 @@ async def health_monitor():
         _health_snapshot = signature
         state["health"] = snapshot
         save_state(state)
+        _log_operation(
+            "info",
+            "Health check finished",
+            phase="health",
+            pair_count=len(state.get("pairs", [])),
+            connected=connected,
+            changed=",".join(sorted(changed)) if changed else "none",
+        )
         if changed and not first_check:
             details = "\n".join(
                 f"{key}: {snapshot.get(key, 'removed')}" for key in sorted(changed)
@@ -4883,9 +5273,26 @@ class WebEvent:
 def _run_async(coro, timeout=25):
     """Run a coroutine from Flask (sync thread) and return result."""
     if _loop is None or not _loop.is_running():
+        _log_operation(
+            "error",
+            "Async dashboard operation rejected while startup is incomplete",
+            phase="dashboard",
+            timeout=timeout,
+        )
         raise RuntimeError("Telegram session is still starting. Please try again in a moment.")
     future = asyncio.run_coroutine_threadsafe(coro, _loop)
-    return future.result(timeout=timeout)
+    try:
+        return future.result(timeout=timeout)
+    except Exception as exc:
+        _log_operation(
+            "error",
+            "Async dashboard operation failed",
+            phase="dashboard",
+            error_type=type(exc).__name__,
+            error=str(exc),
+            timeout=timeout,
+        )
+        raise
 
 
 def _run_bg(coro):
@@ -4903,6 +5310,12 @@ async def _set_source(channel_input):
         default_pair["source"] = ch
         default_pair["source_title"] = state["source_title"]
     save_state(state)
+    _log_operation(
+        "info",
+        "Source channel configured",
+        phase="config",
+        source=state["source_title"],
+    )
     return {"ok": True, "title": state["source_title"]}
 
 
@@ -4916,6 +5329,12 @@ async def _set_target(channel_input):
         default_pair["target"] = ch
         default_pair["target_title"] = state["target_title"]
     save_state(state)
+    _log_operation(
+        "info",
+        "Target channel configured",
+        phase="config",
+        target=state["target_title"],
+    )
     return {"ok": True, "title": state["target_title"]}
 
 
@@ -5076,6 +5495,38 @@ def require_dashboard_auth():
     if request.path == "/api" or request.path.startswith("/api/"):
         return jsonify({"ok": False, "error": "Authentication required"}), 401
     return redirect(url_for("login", next=request.path))
+
+
+@flask_app.before_request
+def log_dashboard_request_start():
+    if request.path in {"/health", "/favicon.ico"} or request.path.startswith("/api/events"):
+        return None
+    request.environ["_syncbot_request_started"] = time.monotonic()
+    _log_operation(
+        "info",
+        "Dashboard request started",
+        phase="dashboard",
+        method=request.method,
+        path=request.path,
+        authenticated=bool(session.get("dashboard_authenticated")),
+    )
+    return None
+
+
+@flask_app.after_request
+def log_dashboard_request_end(response):
+    started = request.environ.get("_syncbot_request_started")
+    if started is not None:
+        _log_operation(
+            "info" if response.status_code < 400 else "warning",
+            "Dashboard request finished",
+            phase="dashboard",
+            method=request.method,
+            path=request.path,
+            status=response.status_code,
+            duration_ms=round((time.monotonic() - started) * 1000, 1),
+        )
+    return response
 
 
 def _safe_next_path(value):
@@ -5732,6 +6183,8 @@ def api_create_task():
 def api_task_control(task_id):
     task = next((t for t in state.get("tasks", []) if t.get("id") == task_id), None)
     if not task:
+        _log_operation("warning", "Task control target not found", phase="task",
+                       task_id=task_id, method=request.method)
         return jsonify({"ok": False, "error": "Task not found"})
     if request.method == "DELETE":
         state.setdefault("task_controls", {})[task_id] = {"cancelled": True, "paused": False}
@@ -5739,10 +6192,19 @@ def api_task_control(task_id):
             if queued["id"] == task_id:
                 _task_queue.remove(queued)
         task["status"] = "cancelled"
+        _log_operation("warning", "Task cancelled", phase="task", task_id=task_id)
     else:
         payload = request.json or {}
         if payload.get("continue") is True:
             ok, message = _resume_paused_task(task)
+            _log_operation(
+                "info" if ok else "warning",
+                "Task continuation requested",
+                phase="task",
+                task_id=task_id,
+                accepted=ok,
+                message=message,
+            )
             return jsonify({"ok": ok, "message": message, "task": _task_view(task)})
         if isinstance(payload.get("settings"), dict):
             if "caption_template" in payload["settings"]:
@@ -5772,12 +6234,27 @@ def api_task_control(task_id):
                     queued["task_settings"] = settings
                     queued["config"] = settings
             save_state(state)
+            _log_operation(
+                "info",
+                "Task settings updated",
+                phase="task",
+                task_id=task_id,
+                setting_count=len(payload["settings"]),
+            )
             return jsonify({"ok": True, "task": _task_view(task)})
         paused = bool(payload.get("paused"))
         state.setdefault("task_controls", {}).setdefault(task_id, {})["paused"] = paused
         task["status"] = "paused" if paused else ("running" if task_id == state.get("active_task_id") else "queued")
     save_state(state)
-    return jsonify({"ok": True, "task": task})
+    _log_operation(
+        "info",
+        "Task updated",
+        phase="task",
+        task_id=task_id,
+        status=task.get("status"),
+        settings_changed=isinstance((request.json or {}).get("settings"), dict),
+    )
+    return jsonify({"ok": True, "task": _task_view(task)})
 
 
 async def bot_continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5827,6 +6304,14 @@ def api_tasks_bulk():
             )
         changed.append(task)
     save_state(state)
+    _log_operation(
+        "info",
+        "Bulk task control applied",
+        phase="task",
+        action=action,
+        requested=len(task_ids),
+        changed=len(changed),
+    )
     return jsonify({"ok": True, "changed": len(changed), "tasks": changed})
 
 
@@ -5843,6 +6328,12 @@ def api_tasks_reorder():
     _task_queue.clear()
     _task_queue.extend(queued[task_id] for task_id in ordered_ids)
     save_state(state)
+    _log_operation(
+        "info",
+        "Task queue reordered",
+        phase="task",
+        queue_size=len(_task_queue),
+    )
     return jsonify({"ok": True, "queue_size": len(_task_queue)})
 
 
@@ -5853,6 +6344,12 @@ def api_autoforward():
         return jsonify({"ok": False, "error": "Set source and target first"})
     state["auto_forward"] = enabled
     save_state(state)
+    _log_operation(
+        "info",
+        "Auto-forward setting changed",
+        phase="config",
+        enabled=enabled,
+    )
     _log_live(f"🔁 Auto-forward {'enabled' if enabled else 'disabled'}")
     return jsonify({"ok": True, "enabled": enabled})
 
@@ -5860,20 +6357,25 @@ def api_autoforward():
 @flask_app.route("/api/pause", methods=["POST"])
 def api_pause():
     if not _set_active_pause(True):
+        _log_operation("warning", "Pause requested without active task", phase="task")
         return jsonify({"ok": False, "error": "No active sync task"}), 409
+    _log_operation("info", "Active task paused", phase="task")
     return jsonify({"ok": True})
 
 
 @flask_app.route("/api/resume", methods=["POST"])
 def api_resume():
     if not _set_active_pause(False):
+        _log_operation("warning", "Resume requested without active task", phase="task")
         return jsonify({"ok": False, "error": "No active sync task"}), 409
+    _log_operation("info", "Active task resumed", phase="task")
     return jsonify({"ok": True})
 
 
 @flask_app.route("/api/stop", methods=["POST"])
 def api_stop():
     _stop_all_tasks()
+    _log_operation("warning", "All tasks stopped", phase="task")
     return jsonify({"ok": True})
 
 
@@ -5882,6 +6384,7 @@ def api_reset():
     _stop_all_tasks()
     _reset_state_defaults()
     save_state(state)
+    _log_operation("warning", "Application state reset", phase="config")
     return jsonify({"ok": True})
 
 
@@ -5930,6 +6433,15 @@ def run_flask():
 async def main():
     global _loop
     _loop = asyncio.get_event_loop()
+    _log_operation(
+        "info",
+        "Application startup",
+        phase="startup",
+        port=os.environ.get("PORT", "8080"),
+        session_present=bool(SESSION_STRING),
+        state_present=_LOCAL_STATE_PRESENT,
+        pair_count=len(state.get("pairs", [])),
+    )
 
     # Start Flask web server in background thread
     t = threading.Thread(target=run_flask, daemon=True)
@@ -5937,11 +6449,29 @@ async def main():
     print("🌐 Web dashboard running on port 8080")
 
     # Start Telethon userbot
-    await client.start(phone=PHONE)
+    try:
+        await client.start(phone=PHONE)
+    except Exception as exc:
+        _log_operation(
+            "error",
+            "Telegram userbot startup failed",
+            phase="startup",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
     persist_session_string()
     if not _LOCAL_STATE_PRESENT:
         await restore_latest_backup()
     me = await client.get_me()
+    _log_operation(
+        "info",
+        "Telegram userbot connected",
+        phase="startup",
+        user_id=getattr(me, "id", None),
+        username=getattr(me, "username", None),
+        first_name=getattr(me, "first_name", None),
+    )
     print(f"✅ Userbot logged in as: {me.first_name} (@{me.username})")
     print(f"🔐 Owner ID: {OWNER_ID}")
 
@@ -5961,6 +6491,12 @@ async def main():
     global _bot_application
     app = Application.builder().token(BOT_TOKEN).build()
     _bot_application = app
+    _log_operation(
+        "info",
+        "Telegram bot application configured",
+        phase="startup",
+        handler_count=18,
+    )
 
     app.add_handler(CommandHandler("start", bot_start))
     app.add_handler(CommandHandler("help", bot_help))
@@ -6000,10 +6536,17 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
+    _log_operation(
+        "info",
+        "Telegram bot polling started",
+        phase="startup",
+        drop_pending_updates=True,
+    )
     asyncio.create_task(health_monitor())
     asyncio.create_task(backup_scheduler())
 
     await client.run_until_disconnected()
+    _log_operation("warning", "Telegram client disconnected", phase="runtime")
 
     await app.updater.stop()
     await app.stop()
