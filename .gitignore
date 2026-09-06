@@ -4,4 +4,5 @@ _login_temp_*.session
 sync_state.json
 sync_state.json.bak
 archive_state.sqlite3
+archive_state.sqlite3-*
 sync.log

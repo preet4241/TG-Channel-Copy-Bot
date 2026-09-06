@@ -29,7 +29,13 @@ deleted after upload. The dashboard's Temporary Storage panel can clean
 leftover failed downloads.
 
 Bulk commands are available through both the Telegram bot and owner userbot:
-`/refresh [task_id]`, `/editcaptions <channel> <template>`, `/mark <channel>
-header|footer <text>`, and a replied image with `/videothumbnail <channel>`.
+`/refresh [task_id]`, `/helpfile`, `/editcaptions <channel> [template]`,
+`/mark <channel> header|footer <text>`, and a replied image with
+`/videothumbnail <channel>`. Caption edits can take their template from a
+replied caption message or ask for it in the next message; `/cancel` and
+`.cancel` cancel that prompt.
+Bulk edits wait 3 seconds per Telegram action, pause 10 seconds after each
+10 actions, honor FloodWait/SlowMode server waits, and retry limited actions
+up to three times.
 Video thumbnails require re-uploading because Telegram does not edit an
 existing media thumbnail in place; originals are retained.

@@ -58,7 +58,8 @@ from telethon.errors import (
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters
 )
 from telethon.sessions import StringSession
 
@@ -975,6 +976,31 @@ def _caption_template_error(template):
     return None
 
 
+async def _bulk_api_call(label, operation, operation_number):
+    """Run one bulk Telegram API action with pacing and limit-aware retries."""
+    for attempt in range(4):
+        try:
+            result = await operation()
+            await asyncio.sleep(MSG_DELAY)
+            if operation_number and operation_number % BATCH_SIZE == 0:
+                _log_live(
+                    f"⏸️ Bulk safety pause after {operation_number} actions "
+                    f"({BATCH_DELAY}s)"
+                )
+                await asyncio.sleep(BATCH_DELAY)
+            return result
+        except (FloodWaitError, SlowModeWaitError) as error:
+            wait_seconds = max(int(getattr(error, "seconds", 30) or 30), 1)
+            if attempt >= 3:
+                raise
+            _log_live(
+                f"⏳ Telegram limit for bulk {label}: waiting "
+                f"{wait_seconds}s before retry {attempt + 1}/3"
+            )
+            await asyncio.sleep(wait_seconds + 5)
+    raise RuntimeError(f"Bulk {label} exhausted retries")
+
+
 def _edited_caption(message, config, source_title=""):
     msg_type = get_msg_type(message)
     text = message.text or ""
@@ -1367,6 +1393,12 @@ HELP_CATEGORIES = [
                 "usage": "/help  or  .help",
             },
             {
+                "commands": ["/helpfile", ".helpfile"],
+                "title": "Complete help TXT file",
+                "why": "Saari commands, usage, safety notes aur placeholders ek downloadable text file mein paane ke liye.",
+                "usage": "/helpfile  or  .helpfile",
+            },
+            {
                 "commands": ["/setsource", ".setsource"],
                 "title": "Source channel set karna",
                 "why": "Jis channel se messages read karne hain usse set karta hai. Public username, channel ID, link, ya forwarded private message use kar sakte ho.",
@@ -1547,8 +1579,8 @@ HELP_CATEGORIES = [
             {
                 "commands": ["/editcaptions", ".editcaptions"],
                 "title": "All file captions edit",
-                "why": "Specified channel ke media/file messages ka caption template se in-place edit karta hai.",
-                "usage": "/editcaptions <channel> <template>\n.editcaptions <channel> <template>",
+                "why": "Specified channel ke media/file messages ka caption in-place edit karta hai. Template inline do, desired caption wale message ko reply karo, ya command ke baad next message mein caption bhejo.",
+                "usage": "/editcaptions <channel> [template]\n.editcaptions <channel> [template]\nReply/prompt: /editcaptions <channel>",
             },
             {
                 "commands": ["/mark", ".mark"],
@@ -1589,6 +1621,7 @@ HELP_CATEGORIES = [
             },
         ],
         "dashboard_note": "Pair settings mein daily message limit, daily media limit, rate profile/custom delay, maximum posts per hour, schedule window aur quiet hours milte hain. Ye controls flood risk aur unwanted timing ko manage karte hain; 0 hourly cap ka matlab no extra hourly cap hai.",
+        "bulk_safety_note": "Bulk channel commands 3-second action delay, 10-action batch pause, FloodWait/SlowMode auto-wait aur up to 3 retries use karte hain.",
     },
     {
         "slug": "dashboard",
@@ -1750,6 +1783,82 @@ def _userbot_help_category_text(category):
     return "\n".join(lines).strip()
 
 
+def _help_file_text():
+    lines = [
+        "TELEGRAM CHANNEL ARCHIVE BOT — COMPLETE COMMAND GUIDE",
+        "=" * 62,
+        "",
+        "Owner-only archive/copy bot. Slash commands work through the Telegram bot;",
+        "dot commands work through the logged-in userbot account.",
+        "",
+    ]
+    for category in HELP_CATEGORIES:
+        lines.extend([
+            category["title"],
+            "-" * len(category["title"]),
+            category["summary"],
+            "",
+        ])
+        for item in category.get("items", []):
+            lines.extend([
+                item["title"],
+                f"Commands: {_help_commands(item)}",
+                f"Why: {item['why']}",
+                f"Usage:\n{item['usage']}",
+                "",
+            ])
+        if category.get("dashboard_note"):
+            lines.extend(["Dashboard:", category["dashboard_note"], ""])
+        if category.get("bulk_safety_note"):
+            lines.extend(["Safety:", category["bulk_safety_note"], ""])
+        if category.get("features"):
+            lines.append("Dashboard features:")
+            for title, body in category["features"]:
+                lines.append(f"- {title}: {body}")
+            lines.append("")
+        if category.get("formatting"):
+            guide = category["formatting"]
+            lines.extend(["Caption formatting:", guide["intro"], ""])
+            for mode in guide["modes"]:
+                lines.extend([mode["name"], mode["note"]])
+                for row in mode["rows"]:
+                    lines.append(f"- {row['label']}: {row['raw']} -> {row['rendered']}")
+                lines.append("Examples:")
+                for example in mode["examples"]:
+                    lines.append(f"- {example['raw']} -> {example['rendered']}")
+                lines.append("")
+            lines.extend([
+                f"Line breaks: {guide['line_breaks']}",
+                f"Template placeholders: {guide['template_note']}",
+                f"Plain text: {guide['plain_note']}",
+                "",
+            ])
+    lines.extend([
+        "BULK SAFETY",
+        "===========",
+        "- Bulk edit actions wait 3 seconds after every Telegram API action.",
+        "- After every 10 actions, the bot pauses for an additional 10 seconds.",
+        "- FloodWait and SlowMode limits use Telegram's suggested wait plus 5 seconds.",
+        "- Each limited action is retried up to 3 times; failed items are reported.",
+        "- Bulk caption edits change captions in place; they do not delete messages.",
+        "- Video thumbnails require replacement uploads; original videos are retained.",
+        "- Review the scanned/changed/skipped/failed report before repeating a command.",
+        "",
+        "CAPTION EDIT OPTIONS",
+        "====================",
+        "1. Reply to a message containing the desired caption, then send:",
+        "   /editcaptions <channel>",
+        "   .editcaptions <channel>",
+        "2. Send the command with the caption template inline:",
+        "   /editcaptions <channel> <caption template>",
+        "3. Send only the channel. The bot will ask for the caption in your next message.",
+        "Supported placeholders: {caption} {filename} {filesize} {filesize_mb}",
+        "{message_id} {source} {date} {time} {mime} {type} {duration} {resolution}",
+        "",
+    ])
+    return "\n".join(lines)
+
+
 def _bot_help_markup(category=None):
     if category is None:
         return _help_category_keyboard()
@@ -1775,6 +1884,19 @@ async def cmd_help(event):
     await event.edit(
         _userbot_help_index_text(),
         buttons=_userbot_help_markup(),
+    )
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.helpfile$"))
+async def cmd_helpfile(event):
+    if not is_owner(event.sender_id):
+        return
+    document = io.BytesIO(_help_file_text().encode("utf-8"))
+    document.name = "archive_bot_commands.txt"
+    await event.respond(
+        "📄 Complete command guide attached hai.",
+        file=document,
+        force_document=True,
     )
 
 
@@ -2289,6 +2411,7 @@ async def _edit_channel_messages(channel_input, operation, value):
         "scanned": 0, "changed": 0, "skipped": 0, "failed": 0,
         "errors": [],
     }
+    operation_number = 0
     async for message in client.iter_messages(entity, reverse=True):
         report["scanned"] += 1
         original = message.text or ""
@@ -2308,20 +2431,16 @@ async def _edit_channel_messages(channel_input, operation, value):
             report["skipped"] += 1
             continue
         try:
-            await client.edit_message(
-                entity, message.id, replacement, parse_mode=None, link_preview=False
+            operation_number += 1
+            await _bulk_api_call(
+                f"{operation} message {message.id}",
+                lambda: client.edit_message(
+                    entity, message.id, replacement,
+                    parse_mode=None, link_preview=False,
+                ),
+                operation_number,
             )
             report["changed"] += 1
-        except FloodWaitError as error:
-            await asyncio.sleep(error.seconds + 5)
-            try:
-                await client.edit_message(
-                    entity, message.id, replacement, parse_mode=None, link_preview=False
-                )
-                report["changed"] += 1
-            except Exception as retry_error:
-                report["failed"] += 1
-                report["errors"].append(f"{message.id}: {type(retry_error).__name__}")
         except Exception as error:
             report["failed"] += 1
             report["errors"].append(f"{message.id}: {type(error).__name__}")
@@ -2341,6 +2460,7 @@ async def _reupload_video_thumbnails(channel_input, thumbnail_path):
         "scanned": 0, "reuploaded": 0, "skipped": 0, "failed": 0,
         "errors": [], "originals_retained": True,
     }
+    operation_number = 0
     async for message in client.iter_messages(entity, reverse=True):
         report["scanned"] += 1
         if get_msg_type(message) != "video":
@@ -2349,30 +2469,20 @@ async def _reupload_video_thumbnails(channel_input, thumbnail_path):
         video_path = None
         try:
             video_path = await fast_download(message.media)
-            await client.send_file(
-                entity,
-                video_path,
-                thumb=str(thumbnail_path),
-                caption=message.text or "",
-                supports_streaming=True,
-                force_document=False,
-            )
-            report["reuploaded"] += 1
-        except FloodWaitError as error:
-            await asyncio.sleep(error.seconds + 5)
-            try:
-                await client.send_file(
+            operation_number += 1
+            await _bulk_api_call(
+                f"thumbnail message {message.id}",
+                lambda: client.send_file(
                     entity,
                     video_path,
                     thumb=str(thumbnail_path),
                     caption=message.text or "",
                     supports_streaming=True,
                     force_document=False,
-                )
-                report["reuploaded"] += 1
-            except Exception as retry_error:
-                report["failed"] += 1
-                report["errors"].append(f"{message.id}: {type(retry_error).__name__}")
+                ),
+                operation_number,
+            )
+            report["reuploaded"] += 1
         except Exception as error:
             report["failed"] += 1
             report["errors"].append(f"{message.id}: {type(error).__name__}")
@@ -2405,6 +2515,10 @@ def _format_bulk_report(title, report):
             "Original videos retained: yes",
         ])
     lines.append(f"Failed: {report.get('failed', 0)}")
+    lines.extend([
+        "Safety: 3s per Telegram action; 10-action batch pause; "
+        "FloodWait/SlowMode auto-wait + up to 3 retries",
+    ])
     errors = report.get("errors") or []
     if errors:
         lines.append("Errors: " + ", ".join(errors[:5]))
@@ -2441,12 +2555,41 @@ async def cmd_backup(event):
     )
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r"^\.editcaptions\s+(\S+)\s+([\s\S]+)$"))
+_pending_userbot_caption = {}
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.cancel$"))
+async def cmd_cancel(event):
+    if not is_owner(event.sender_id):
+        return
+    if _pending_userbot_caption.pop(event.sender_id, None):
+        await event.edit("✅ Pending caption prompt cancel kar diya.")
+    else:
+        await event.edit("ℹ️ Koi pending caption prompt nahi hai.")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.editcaptions(?:\s+(\S+))?(?:\s+([\s\S]+))?$"))
 async def cmd_editcaptions(event):
     if not is_owner(event.sender_id):
         return
     channel_input = event.pattern_match.group(1)
-    template = event.pattern_match.group(2).strip()
+    template = (event.pattern_match.group(2) or "").strip()
+    if not channel_input:
+        await event.edit(
+            "Usage: `.editcaptions <channel> [caption template]`\n"
+            "Ya desired caption wale message ko reply karke `.editcaptions <channel>` bhejo."
+        )
+        return
+    if not template:
+        replied = await event.get_reply_message()
+        template = (getattr(replied, "message", None) or "").strip() if replied else ""
+    if not template:
+        _pending_userbot_caption[event.sender_id] = channel_input
+        await event.edit(
+            "✏️ Caption template bhejo. Is message ka next normal text caption banega.\n"
+            "Cancel ke liye koi naya command bhej do."
+        )
+        return
     template_error = _caption_template_error(template)
     if template_error:
         await event.edit(f"❌ {template_error}")
@@ -2454,6 +2597,27 @@ async def cmd_editcaptions(event):
     await event.edit("✏️ Channel captions edit ho rahe hain...")
     asyncio.create_task(_reply_bulk_report(
         event.edit, "Channel caption edit complete", "caption", channel_input, template
+    ))
+
+
+@client.on(events.NewMessage(outgoing=True))
+async def cmd_userbot_caption_prompt(event):
+    if not is_owner(event.sender_id):
+        return
+    channel_input = _pending_userbot_caption.get(event.sender_id)
+    if not channel_input or event.raw_text.startswith("."):
+        return
+    template = event.raw_text.strip()
+    if not template:
+        return
+    _pending_userbot_caption.pop(event.sender_id, None)
+    template_error = _caption_template_error(template)
+    if template_error:
+        await event.reply(f"❌ {template_error}")
+        return
+    await event.reply("✏️ Caption mil gaya. Channel captions edit ho rahe hain...")
+    asyncio.create_task(_reply_bulk_report(
+        event.reply, "Channel caption edit complete", "caption", channel_input, template
     ))
 
 
@@ -2533,6 +2697,18 @@ async def bot_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _bot_help_index_text(),
         parse_mode="HTML",
         reply_markup=_bot_help_markup(),
+    )
+
+
+async def bot_helpfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    document = io.BytesIO(_help_file_text().encode("utf-8"))
+    document.name = "archive_bot_commands.txt"
+    await update.message.reply_document(
+        document=document,
+        filename="archive_bot_commands.txt",
+        caption="📄 Complete command guide attached hai.",
     )
 
 
@@ -2971,19 +3147,64 @@ async def bot_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bot_editcaptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
-    if len(context.args) < 2:
+    if not context.args:
         await update.message.reply_text(
-            "Usage: /editcaptions <channel> <caption template>\n"
+            "Usage: /editcaptions <channel> [caption template]\n"
+            "Ya desired caption wale message ko reply karke /editcaptions <channel> bhejo.\n"
+            "Caption na dene par bot next message mein caption maangega.\n"
             "Placeholders: {caption} {filename} {message_id} {type} {filesize}"
         )
         return
     channel_input = context.args[0]
     template = " ".join(context.args[1:]).strip()
+    if not template:
+        replied = update.message.reply_to_message
+        template = (
+            (getattr(replied, "text", None) or getattr(replied, "caption", None) or "").strip()
+            if replied else ""
+        )
+    if not template:
+        context.user_data["bulk_caption_channel"] = channel_input
+        await update.message.reply_text(
+            "✏️ Caption template bhejo. Tumhara next normal message caption banega.\n"
+            "Cancel karne ke liye /cancel bhejo."
+        )
+        return
     template_error = _caption_template_error(template)
     if template_error:
         await update.message.reply_text(f"❌ {template_error}")
         return
     await update.message.reply_text("✏️ Channel ke file captions edit ho rahe hain...")
+    asyncio.create_task(_reply_bulk_report(
+        update.message.reply_text, "Channel caption edit complete",
+        "caption", channel_input, template
+    ))
+
+
+async def bot_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    if context.user_data.pop("bulk_caption_channel", None):
+        await update.message.reply_text("✅ Pending caption prompt cancel kar diya.")
+    else:
+        await update.message.reply_text("ℹ️ Koi pending caption prompt nahi hai.")
+
+
+async def bot_bulk_caption_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update) or not update.message:
+        return
+    channel_input = context.user_data.pop("bulk_caption_channel", None)
+    if not channel_input:
+        return
+    template = (update.message.text or "").strip()
+    if not template or template.startswith("."):
+        context.user_data["bulk_caption_channel"] = channel_input
+        return
+    template_error = _caption_template_error(template)
+    if template_error:
+        await update.message.reply_text(f"❌ {template_error}")
+        return
+    await update.message.reply_text("✏️ Caption mil gaya. Channel captions edit ho rahe hain...")
     asyncio.create_task(_reply_bulk_report(
         update.message.reply_text, "Channel caption edit complete",
         "caption", channel_input, template
@@ -5289,6 +5510,7 @@ async def main():
 
     app.add_handler(CommandHandler("start", bot_start))
     app.add_handler(CommandHandler("help", bot_help))
+    app.add_handler(CommandHandler("helpfile", bot_helpfile))
     app.add_handler(CommandHandler("setsource", bot_setsource))
     app.add_handler(CommandHandler("settarget", bot_settarget))
     app.add_handler(CommandHandler("info", bot_info))
@@ -5310,6 +5532,8 @@ async def main():
     app.add_handler(CommandHandler("editcaptions", bot_editcaptions))
     app.add_handler(CommandHandler("mark", bot_mark))
     app.add_handler(CommandHandler("videothumbnail", bot_videothumbnail))
+    app.add_handler(CommandHandler("cancel", bot_cancel))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot_bulk_caption_prompt))
     app.add_handler(CallbackQueryHandler(bot_help_callback, pattern=r"^help:"))
     app.add_handler(CallbackQueryHandler(bot_continue_callback, pattern=r"^continue:"))
 

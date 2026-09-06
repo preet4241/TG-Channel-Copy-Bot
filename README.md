@@ -205,6 +205,7 @@ Userbot account se bheje gaye commands dot prefix use karte hain. Sirf
 | Command | Action |
 |---|---|
 | `.help` | Command list |
+| `.helpfile` | Complete detailed command guide as TXT file |
 | `.setsource @username` | Source set |
 | `.setsource -100123...` | Source ID set |
 | `.setsource` | Replied forwarded message se source set |
@@ -217,7 +218,7 @@ Userbot account se bheje gaye commands dot prefix use karte hain. Sirf
 | `.synclast <n>` | Last N messages sync |
 | `.refresh [task_id]` | Full source rescan; existing copies duplicate count ke saath skip |
 | `.backup` | Current state ka JSON backup Telegram backup channel mein upload |
-| `.editcaptions <channel> <template>` | Channel ke media/file captions bulk edit |
+| `.editcaptions <channel> [template]` | Caption bulk edit; reply-based ya next-message caption prompt bhi |
 | `.mark <channel> header\|footer <text>` | Har message par header ya footer add |
 | `.videothumbnail <channel>` | Replied image se videos re-upload with thumbnail; originals retain |
 | `.pause` | Running sync pause |
@@ -235,6 +236,7 @@ owner-only hain.
 |---|---|
 | `/start` | Bot introduction |
 | `/help` | Command list |
+| `/helpfile` | Complete detailed command guide as TXT file |
 | `/setsource <channel>` | Source set |
 | `/settarget <channel>` | Target set |
 | `/info` | Current configuration |
@@ -249,7 +251,7 @@ owner-only hain.
 | `/setthumbnail <pair_id>` | Replied photo ko video thumbnail set karo |
 | `/setthumbnail <pair_id> off` | Thumbnail disable |
 | `/backup` | Current state ka JSON backup Telegram backup channel mein upload |
-| `/editcaptions <channel> <template>` | Channel ke media/file captions bulk edit |
+| `/editcaptions <channel> [template]` | Caption bulk edit; reply-based ya next-message caption prompt bhi |
 | `/mark <channel> header\|footer <text>` | Har message par header ya footer add |
 | `/videothumbnail <channel>` | Replied image se videos re-upload with thumbnail; originals retain |
 | `/pause` | Sync pause |
@@ -287,6 +289,11 @@ Dashboard mein ye panels/actions available hain:
 - Temporary storage usage aur cleanup
 - Searchable live logs
 - Duplicate identities clear karke copy-again
+
+Bulk channel commands 3-second per-action pacing, 10-action batch pause,
+FloodWait/SlowMode suggested wait plus retry, aur failed-item reporting use
+karte hain. Video thumbnail operation replacement videos banata hai aur
+originals retain karta hai.
 
 ## HTTP API
 
