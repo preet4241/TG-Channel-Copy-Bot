@@ -89,9 +89,12 @@ function renderDashboard() {
   const s = appData.status || {}, stats = s.stats || {}, tasks = appData.tasks || [];
   const copied = ['text','photo','video','doc','other'].reduce((sum,key) => sum + Number(stats[key] || 0), 0);
   const set = (id, value) => { const node = document.getElementById(id); if (node) node.textContent = value; };
-  set('dash-copied', copied); set('dash-failed', stats.failed || 0); set('dash-progress', `${s.pct || 0}%`);
+  set('dash-copied', s.transferred ?? copied); set('dash-failed', stats.failed || 0);
+  set('dash-duplicates', s.duplicates ?? stats.duplicates ?? 0);
+  set('dash-pending', s.pending ?? 0); set('dash-progress', `${s.pct || 0}%`);
   set('dash-progress-note', s.running ? 'Task in progress' : 'No active task'); set('dash-pairs', appData.pairs.length);
   set('dash-progress-count', `${s.current || 0} / ${s.total || 0}`); set('dash-last-sync', `Last synced ID ${s.last_id || '—'}`);
+  set('dash-source-status', s.source_status || 'Idle'); set('dash-transferred', s.transferred ?? copied);
   set('dash-transfer', s.transfer ? `${s.transfer.phase}: ${s.transfer.file}` : (s.running ? 'Syncing messages' : 'Waiting for a task'));
   const bar = document.getElementById('dash-progress-bar'); if (bar) bar.style.width = `${s.pct || 0}%`;
   const run = document.getElementById('dash-run-status'); if (run) { const activePaused = !!s.running && !!s.paused; run.className = `status-pill ${activePaused ? 'paused' : s.running ? 'running' : 'neutral'}`; run.textContent = activePaused ? 'Paused' : s.running ? 'Running' : 'Stopped'; }

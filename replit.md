@@ -17,9 +17,19 @@ Telethon userbot plus Telegram Bot API controller in the same process.
 in Replit Secrets. The Telethon session is persisted to `session_string.txt`
 after a successful login.
 
+The first startup without local state checks Telegram backup channel
+`-1003941432857` for the newest JSON state backup and restores it. The owner can
+also send `/backup` or `.backup` to upload the current state snapshot there.
+
 ## Storage safety
 
 Temporary media is downloaded under `/tmp/archive_bot`. Downloads are
 preflight-checked against a hard 1.8 GB temporary-storage budget and are
 deleted after upload. The dashboard's Temporary Storage panel can clean
 leftover failed downloads.
+
+Bulk commands are available through both the Telegram bot and owner userbot:
+`/refresh [task_id]`, `/editcaptions <channel> <template>`, `/mark <channel>
+header|footer <text>`, and a replied image with `/videothumbnail <channel>`.
+Video thumbnails require re-uploading because Telegram does not edit an
+existing media thumbnail in place; originals are retained.

@@ -65,11 +65,16 @@ from telethon.sessions import StringSession
 
 _dashboard_condition = threading.Condition()
 _dashboard_revision = 0
+_dashboard_last_notify = 0.0
 
 
-def _dashboard_changed():
+def _dashboard_changed(force=False):
     """Wake dashboard SSE clients after a meaningful state/log change."""
-    global _dashboard_revision
+    global _dashboard_revision, _dashboard_last_notify
+    now = time.monotonic()
+    if not force and now - _dashboard_last_notify < 1.5:
+        return
+    _dashboard_last_notify = now
     with _dashboard_condition:
         _dashboard_revision += 1
         _dashboard_condition.notify_all()
@@ -185,6 +190,7 @@ STATE_DB_FILE = "archive_state.sqlite3"
 STATE_SCHEMA_VERSION = 2
 STATE_WRITE_LOCK = threading.Lock()
 TELEGRAM_STARTING = True
+DEFAULT_BACKUP_CHANNEL = -1003941432857
 
 # ─── LOGGER SETUP ─────────────────────────────────────
 logger = logging.getLogger("SyncBot")
@@ -358,10 +364,16 @@ def save_state(state):
         os.replace(tmp_path, STATE_FILE)
     _dashboard_changed()
 
+_LOCAL_STATE_PRESENT = any(
+    Path(path).exists() for path in (STATE_FILE, STATE_BACKUP_FILE, STATE_DB_FILE)
+)
 state = load_state()
 state.setdefault("auto_forward", False)
 state.setdefault("tasks", [])
-state.setdefault("auto_stats", {"sent": 0, "failed": 0})
+state.setdefault("auto_stats", {"sent": 0, "failed": 0, "duplicates": 0})
+state["auto_stats"].setdefault("duplicates", 0)
+state.setdefault("backup_channel", DEFAULT_BACKUP_CHANNEL)
+state.setdefault("backup_last_upload_epoch", 0)
 if not state.get("pairs"):
     if state.get("source") and state.get("target"):
         state["pairs"] = [{
@@ -416,6 +428,128 @@ for _batch in state["batches"]:
 if _state_batches_changed:
     save_state(state)
 
+
+def _ensure_state_defaults_after_restore():
+    """Keep a restored backup compatible with the current runtime."""
+    state.setdefault("auto_forward", False)
+    state.setdefault("tasks", [])
+    state.setdefault("auto_stats", {"sent": 0, "failed": 0, "duplicates": 0})
+    state["auto_stats"].setdefault("duplicates", 0)
+    state.setdefault("backup_channel", DEFAULT_BACKUP_CHANNEL)
+    state.setdefault("backup_last_upload_epoch", 0)
+    state.setdefault("dedupe", {})
+    state.setdefault("task_controls", {})
+    state.setdefault("message_map", {})
+    state.setdefault("media_fingerprints", {})
+    state.setdefault("pair_health", {})
+    state.setdefault("oversized_messages", [])
+    state.setdefault("templates", {})
+    if not state.get("pairs") and state.get("source") and state.get("target"):
+        state["pairs"] = [{
+            "id": "default",
+            "name": "Default pair",
+            "source": state["source"],
+            "target": state["target"],
+            "source_title": state.get("source_title", str(state["source"])),
+            "target_title": state.get("target_title", str(state["target"])),
+            "allowed_types": ["text", "photo", "video", "doc", "other"],
+            "include_keywords": [],
+            "exclude_keywords": [],
+            "caption_prefix": "",
+            "caption_suffix": "",
+            "rate_delay": MSG_DELAY,
+        }]
+    state.setdefault("batches", [{
+        "id": "default",
+        "name": "Default batch",
+        "auto_forward": True,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }])
+    batch_ids = {str(batch.get("id")) for batch in state["batches"]}
+    for pair in state.get("pairs", []):
+        pair.setdefault("auto_forward", True)
+        if not pair.get("batch_id") or str(pair["batch_id"]) not in batch_ids:
+            pair["batch_id"] = "default"
+    for batch in state["batches"]:
+        batch.setdefault("auto_forward", True)
+    return state
+
+
+async def restore_latest_backup():
+    """Restore the newest JSON state file from the configured Telegram channel."""
+    backup_channel = state.get("backup_channel", DEFAULT_BACKUP_CHANNEL)
+    try:
+        entity = await client.get_entity(backup_channel)
+        messages = await client.get_messages(entity, limit=50)
+        candidates = []
+        for message in messages:
+            document = getattr(getattr(message, "media", None), "document", None)
+            if not document:
+                continue
+            filename = ""
+            for attr in getattr(document, "attributes", []) or []:
+                if isinstance(attr, DocumentAttributeFilename):
+                    filename = attr.file_name or ""
+                    break
+            if filename.lower().endswith((".json", ".backup")) or "backup" in filename.lower():
+                candidates.append(message)
+        if not candidates:
+            logger.info("No JSON backup found in Telegram backup channel")
+            return False
+        candidates.sort(key=lambda item: getattr(item, "date", datetime.min), reverse=True)
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        path = TEMP_DIR / f"restore_{uuid.uuid4().hex}.json"
+        downloaded = await client.download_media(candidates[0], file=str(path))
+        if not downloaded:
+            raise RuntimeError("Telegram backup file could not be downloaded")
+        with open(downloaded, encoding="utf-8") as handle:
+            restored = json.load(handle)
+        if not isinstance(restored, dict):
+            raise ValueError("Backup JSON root must be an object")
+        if not any(key in restored for key in ("pairs", "source", "tasks")):
+            raise ValueError("Backup JSON does not look like archive bot state")
+        state.clear()
+        state.update(restored)
+        _ensure_state_defaults_after_restore()
+        save_state(state)
+        logger.info("Restored latest Telegram backup from message %s", candidates[0].id)
+        _log_live(f"♻️ Restored latest state backup from Telegram (message {candidates[0].id})")
+        return True
+    except Exception as exc:
+        logger.warning("Telegram backup restore skipped: %s", exc)
+        return False
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except (NameError, OSError):
+            pass
+
+
+async def upload_state_backup(force=False):
+    """Upload the current JSON state to the configured Telegram backup channel."""
+    now = time.time()
+    last_upload = float(state.get("backup_last_upload_epoch", 0) or 0)
+    if not force and now - last_upload < 300:
+        return False
+    backup_channel = state.get("backup_channel", DEFAULT_BACKUP_CHANNEL)
+    try:
+        save_state(state)
+        entity = await client.get_entity(backup_channel)
+        caption = (
+            "Archive Bot state backup\n"
+            f"Created: {datetime.now().isoformat(timespec='seconds')}\n"
+            f"Schema: {STATE_SCHEMA_VERSION}"
+        )
+        await client.send_file(entity, STATE_FILE, caption=caption, force_document=True)
+        state["backup_last_upload_epoch"] = now
+        save_state(state)
+        _log_live(f"💾 State backup uploaded to Telegram channel {backup_channel}")
+        return True
+    except Exception as exc:
+        logger.warning("Telegram state backup upload failed: %s", exc)
+        _log_live(f"⚠️ Backup upload failed: {type(exc).__name__}")
+        return False
+
 # Sync requests are queued instead of being rejected while another sync runs.
 _task_queue = deque()
 _task_worker_running = False
@@ -441,6 +575,12 @@ def _task_view(task):
         "finished_at": task.get("finished_at"),
         "total": task.get("total", 0),
         "current": task.get("current", 0),
+        "scanned": task.get("scanned", task.get("current", 0)),
+        "transferred": task.get("stats", {}).get("text", 0)
+        + task.get("stats", {}).get("photo", 0)
+        + task.get("stats", {}).get("video", 0)
+        + task.get("stats", {}).get("doc", 0)
+        + task.get("stats", {}).get("other", 0),
         "pause_reason": task.get("pause_reason"),
         "paused_at": task.get("paused_at"),
         "resume_min_id": task.get("resume_min_id", task.get("min_id", 0)),
@@ -950,6 +1090,9 @@ async def _task_worker():
             state["stats"] = reset_stats()
             state["current_id"] = 0
             state["total_msgs"] = 0
+            state["scanned_msgs"] = 0
+            state["transfer_count"] = 0
+            state["source_status"] = "Scanning"
             state.pop("_task_pause_requested", None)
             state.pop("_task_pause_reason", None)
             state.pop("_task_resume_min_id", None)
@@ -998,6 +1141,7 @@ async def _task_worker():
                 task["stats"] = dict(state.get("stats", {}))
                 task["total"] = state.get("total_msgs", 0)
                 task["current"] = state.get("current_id", 0)
+                task["scanned"] = state.get("scanned_msgs", task["current"])
                 task_view = _task_view(task)
                 state["tasks"] = [
                     task_view if item.get("id") == task["id"] else item
@@ -1007,6 +1151,8 @@ async def _task_worker():
                 if _task_queue:
                     state["running"] = True
                 save_state(state)
+                if task["status"] in {"complete", "partial"}:
+                    await upload_state_backup()
                 notification_key = "task_failed" if task["status"] == "failed" else "task_complete"
                 if state.get("notification_settings", {}).get(notification_key, True):
                     status_icon = {"complete": "✅", "partial": "⚠️", "failed": "❌"}.get(
@@ -1174,17 +1320,22 @@ def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
 def reset_stats():
-    return {"text": 0, "photo": 0, "video": 0, "doc": 0, "other": 0, "failed": 0}
+    return {
+        "text": 0, "photo": 0, "video": 0, "doc": 0, "other": 0,
+        "failed": 0, "duplicates": 0, "skipped": 0,
+    }
 
 def stats_text(stats: dict) -> str:
-    total = sum(v for k, v in stats.items() if k != "failed")
+    total = sum(stats.get(k, 0) for k in ("text", "photo", "video", "doc", "other"))
     return (
-        f"Text: {stats['text']}\n"
-        f"Photo: {stats['photo']}\n"
-        f"Video: {stats['video']}\n"
-        f"Doc: {stats['doc']}\n"
-        f"Other: {stats['other']}\n"
-        f"Failed: {stats['failed']}\n"
+        f"Text: {stats.get('text', 0)}\n"
+        f"Photo: {stats.get('photo', 0)}\n"
+        f"Video: {stats.get('video', 0)}\n"
+        f"Doc: {stats.get('doc', 0)}\n"
+        f"Other: {stats.get('other', 0)}\n"
+        f"Failed: {stats.get('failed', 0)}\n"
+        f"Duplicates: {stats.get('duplicates', 0)}\n"
+        f"Skipped/filtered: {stats.get('skipped', 0)}\n"
         f"Total: {total}"
     )
 
@@ -1293,8 +1444,8 @@ HELP_CATEGORIES = [
             {
                 "commands": ["/refresh", ".refresh"],
                 "title": "New posts refresh",
-                "why": "Last synced message ke baad ke naye posts copy karne ke liye. Live auto-forward se alag, ye manual catch-up hai.",
-                "usage": "/refresh  or  .refresh",
+                "why": "Source ki poori history rescan karta hai. Existing copies dedupe se skip hoti hain, naye posts target mein chale jaate hain. Task ID dene par us task ka route rescan hota hai.",
+                "usage": "/refresh [task_id]\n.refresh [task_id]",
             },
             {
                 "commands": ["Continue button"],
@@ -1387,6 +1538,37 @@ HELP_CATEGORIES = [
             "template_note": "Template placeholders normal text ki tarah expand hote hain. Markdown mein *{filename}* aur HTML mein <b>{filename}</b> filename ko bold banayega. Placeholder value khud user input ho sakti hai, isliye unusual characters ke saath plain mode ya carefully escaped formatting use karo.",
             "plain_note": "caption_parse_mode=plain tab use karo jab source captions mein raw *, _, [, < ya & jaise characters hon, ya tumhe koi formatting nahi chahiye. Plain mode safest hai: caption as-is bheja jaata hai, formatting apply nahi hoti.",
         },
+    },
+    {
+        "slug": "bulk",
+        "title": "🧰 Bulk channel tools",
+        "summary": "Kisi existing channel ke messages par caption, header/footer aur video thumbnail operations.",
+        "items": [
+            {
+                "commands": ["/editcaptions", ".editcaptions"],
+                "title": "All file captions edit",
+                "why": "Specified channel ke media/file messages ka caption template se in-place edit karta hai.",
+                "usage": "/editcaptions <channel> <template>\n.editcaptions <channel> <template>",
+            },
+            {
+                "commands": ["/mark", ".mark"],
+                "title": "Header ya footer mark",
+                "why": "Channel ke har message ke start ya end par supplied text add karta hai.",
+                "usage": "/mark <channel> header|footer <text>\n.mark <channel> header|footer <text>",
+            },
+            {
+                "commands": ["/videothumbnail", ".videothumbnail"],
+                "title": "Video thumbnail replace",
+                "why": "Reply ki hui image se channel ke videos re-upload karta hai. Telegram purane media ka thumbnail in-place edit nahi karta, isliye originals retain hote hain.",
+                "usage": "Photo ko reply karke:\n/videothumbnail <channel>",
+            },
+            {
+                "commands": ["/backup", ".backup"],
+                "title": "State backup",
+                "why": "Current JSON/SQLite-backed state ka JSON snapshot Telegram backup channel mein upload karta hai.",
+                "usage": "/backup  or  .backup",
+            },
+        ],
     },
     {
         "slug": "limits",
@@ -1855,18 +2037,27 @@ async def cmd_status_userbot(event):
     if not state.get("running"):
         stats = state.get("stats", reset_stats())
         await event.edit(
-            f"🔴 **Not Running**\n\nLast session stats:\n{stats_text(stats)}"
+            f"🔴 **Not Running**\n\n"
+            f"Source status: {state.get('source_status', 'Idle')}\n"
+            f"Transferred: `{state.get('transfer_count', state.get('current_id', 0))}`\n"
+            f"Duplicates: `{stats.get('duplicates', 0)}`\n\n"
+            f"Last session stats:\n{stats_text(stats)}"
         )
         return
     stats = state.get("stats", reset_stats())
-    current = state.get("current_id", 0)
+    current = state.get("scanned_msgs", state.get("current_id", 0))
     total = state.get("total_msgs", 0)
     paused = "⏸️ Paused" if state.get("paused") else "🟢 Running"
     pct = f"{(current/total*100):.1f}%" if total else "?"
     await event.edit(
         f"📊 **Live Status**\n\n"
+        f"Source: `{state.get('source_title', 'Not set')}`\n"
+        f"Source status: {state.get('source_status', 'Scanning')}\n"
         f"State: {paused}\n"
-        f"Progress: `{current}/{total}` ({pct})\n\n"
+        f"Pending: `{max(total - current, 0)}`\n"
+        f"Transferred: `{state.get('transfer_count', state.get('current_id', 0))}`\n"
+        f"Duplicates: `{stats.get('duplicates', 0)}`\n"
+        f"Scanned: `{current}/{total}` ({pct})\n\n"
         f"{stats_text(stats)}"
     )
 
@@ -1917,7 +2108,9 @@ def _reset_state_defaults():
         "tasks": [],
         "task_controls": {},
         "auto_forward": False,
-        "auto_stats": {"sent": 0, "failed": 0},
+        "auto_stats": {"sent": 0, "failed": 0, "duplicates": 0},
+        "backup_channel": DEFAULT_BACKUP_CHANNEL,
+        "backup_last_upload_epoch": 0,
         "dedupe": {},
         "message_map": {},
         "oversized_messages": [],
@@ -1988,8 +2181,8 @@ async def cmd_synclast(event):
     await start_sync_userbot(event, reverse=False, limit=n)
 
 
-async def refresh_sources(progress_msg, is_bot=True):
-    """Queue only messages newer than the last observed source message."""
+async def refresh_sources(progress_msg, is_bot=True, task_id=None):
+    """Rescan source history; dedupe keeps already copied messages out of target."""
     pairs = list(state.get("pairs", []))
     if not pairs and state.get("source") and state.get("target"):
         pairs = [{
@@ -2004,24 +2197,35 @@ async def refresh_sources(progress_msg, is_bot=True):
         await (progress_msg.edit_text(text) if is_bot else progress_msg.edit(text))
         return
 
+    if task_id:
+        selected_task = next(
+            (item for item in state.get("tasks", []) if str(item.get("id")) == str(task_id)),
+            None,
+        )
+        if not selected_task:
+            text = f"❌ Task `{task_id}` nahi mila."
+            await (progress_msg.edit_text(text) if is_bot else progress_msg.edit(text))
+            return
+        selected_pair = _pair_by_id(selected_task.get("pair_id"))
+        if selected_pair:
+            pairs = [selected_pair]
+        else:
+            pairs = [{
+                "id": selected_task.get("pair_id", "default"),
+                "source": selected_task.get("source"),
+                "target": selected_task.get("target"),
+                "source_title": selected_task.get("source", ""),
+                "target_title": selected_task.get("target", ""),
+            }]
+
     queued = []
     skipped = []
-    source_last_ids = state.setdefault("source_last_ids", {})
     for pair in pairs:
         try:
             source_entity = await client.get_entity(pair["source"])
-            latest = await client.get_messages(source_entity, limit=1)
-            latest_message = latest[0] if latest else None
-            latest_id = getattr(latest_message, "id", 0)
             pair_id = str(pair.get("id", "default"))
-            last_id = int(source_last_ids.get(pair_id, 0) or 0)
-            if not last_id and pair["source"] == state.get("source"):
-                last_id = int(state.get("last_synced_id", 0) or 0)
-            if latest_id <= last_id:
-                skipped.append(pair.get("name", pair_id))
-                continue
             queued.append(_queue_sync(
-                pair["source"], pair["target"], True, last_id, None,
+                pair["source"], pair["target"], True, 0, None,
                 progress_msg, is_bot, "refresh", pair_id,
                 _pair_config(pair)
             ))
@@ -2030,19 +2234,276 @@ async def refresh_sources(progress_msg, is_bot=True):
             skipped.append(f"{pair.get('name', pair.get('id', 'pair'))}: {type(exc).__name__}")
 
     if queued:
-        summary = f"🔄 {len(queued)} refresh task(s) queued"
+        summary = f"🔄 {len(queued)} full rescan task(s) queued"
+        if task_id:
+            summary = f"🔄 Task `{task_id}` ka full rescan queued"
         if skipped:
             summary += f"\n⏭️ No new posts/error: {len(skipped)}"
     else:
-        summary = "✅ Source refreshed — koi naya post nahi mila."
+        summary = "✅ Source rescan complete — koi route queue nahi hua."
     await (progress_msg.edit_text(summary) if is_bot else progress_msg.edit(summary))
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r"^\.refresh$"))
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.refresh(?:\s+([a-zA-Z0-9_-]+))?$"))
 async def cmd_refresh(event):
     if not is_owner(event.sender_id):
         return
-    await refresh_sources(event, is_bot=False)
+    await refresh_sources(
+        event, is_bot=False, task_id=event.pattern_match.group(1)
+    )
+
+
+async def _resolve_bulk_channel(channel_input):
+    channel = parse_channel_input(channel_input)
+    entity = await client.get_entity(channel)
+    return channel, entity
+
+
+def _bulk_caption_text(message, template):
+    values = {
+        "caption": message.text or "",
+        "filename": "",
+        "filesize": _human_size(getattr(getattr(getattr(message, "media", None), "document", None), "size", 0)),
+        "filesize_mb": f"{_media_size_mb(message):.2f}",
+        "message_id": str(getattr(message, "id", "")),
+        "source": getattr(getattr(message, "chat", None), "title", ""),
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "time": datetime.now().strftime("%H:%M"),
+        "mime": getattr(getattr(getattr(message, "media", None), "document", None), "mime_type", ""),
+        "type": get_msg_type(message),
+        **_caption_media_values(message),
+    }
+    document = getattr(getattr(message, "media", None), "document", None)
+    for attribute in getattr(document, "attributes", []) or []:
+        if isinstance(attribute, DocumentAttributeFilename):
+            values["filename"] = attribute.file_name or ""
+            break
+    return template.format_map(_SafeFormat(values))
+
+
+async def _edit_channel_messages(channel_input, operation, value):
+    """Edit existing messages in place and return an operational report."""
+    _channel, entity = await _resolve_bulk_channel(channel_input)
+    report = {
+        "channel": getattr(entity, "title", str(channel_input)),
+        "scanned": 0, "changed": 0, "skipped": 0, "failed": 0,
+        "errors": [],
+    }
+    async for message in client.iter_messages(entity, reverse=True):
+        report["scanned"] += 1
+        original = message.text or ""
+        if operation == "caption" and (
+            not getattr(message, "media", None)
+            or isinstance(message.media, MessageMediaWebPage)
+        ):
+            report["skipped"] += 1
+            continue
+        if operation == "header":
+            replacement = value if not original else f"{value}\n\n{original}"
+        elif operation == "footer":
+            replacement = value if not original else f"{original}\n\n{value}"
+        else:
+            replacement = _bulk_caption_text(message, value)
+        if replacement == original:
+            report["skipped"] += 1
+            continue
+        try:
+            await client.edit_message(
+                entity, message.id, replacement, parse_mode=None, link_preview=False
+            )
+            report["changed"] += 1
+        except FloodWaitError as error:
+            await asyncio.sleep(error.seconds + 5)
+            try:
+                await client.edit_message(
+                    entity, message.id, replacement, parse_mode=None, link_preview=False
+                )
+                report["changed"] += 1
+            except Exception as retry_error:
+                report["failed"] += 1
+                report["errors"].append(f"{message.id}: {type(retry_error).__name__}")
+        except Exception as error:
+            report["failed"] += 1
+            report["errors"].append(f"{message.id}: {type(error).__name__}")
+        if report["scanned"] % 25 == 0:
+            _log_live(
+                f"✏️ Bulk {operation}: {report['scanned']} scanned, "
+                f"{report['changed']} changed, {report['failed']} failed"
+            )
+    return report
+
+
+async def _reupload_video_thumbnails(channel_input, thumbnail_path):
+    """Re-upload videos with a thumbnail; Telegram cannot edit an old thumbnail in place."""
+    _channel, entity = await _resolve_bulk_channel(channel_input)
+    report = {
+        "channel": getattr(entity, "title", str(channel_input)),
+        "scanned": 0, "reuploaded": 0, "skipped": 0, "failed": 0,
+        "errors": [], "originals_retained": True,
+    }
+    async for message in client.iter_messages(entity, reverse=True):
+        report["scanned"] += 1
+        if get_msg_type(message) != "video":
+            report["skipped"] += 1
+            continue
+        video_path = None
+        try:
+            video_path = await fast_download(message.media)
+            await client.send_file(
+                entity,
+                video_path,
+                thumb=str(thumbnail_path),
+                caption=message.text or "",
+                supports_streaming=True,
+                force_document=False,
+            )
+            report["reuploaded"] += 1
+        except FloodWaitError as error:
+            await asyncio.sleep(error.seconds + 5)
+            try:
+                await client.send_file(
+                    entity,
+                    video_path,
+                    thumb=str(thumbnail_path),
+                    caption=message.text or "",
+                    supports_streaming=True,
+                    force_document=False,
+                )
+                report["reuploaded"] += 1
+            except Exception as retry_error:
+                report["failed"] += 1
+                report["errors"].append(f"{message.id}: {type(retry_error).__name__}")
+        except Exception as error:
+            report["failed"] += 1
+            report["errors"].append(f"{message.id}: {type(error).__name__}")
+        finally:
+            if video_path:
+                Path(video_path).unlink(missing_ok=True)
+        if report["scanned"] % 10 == 0:
+            _log_live(
+                f"🖼️ Video thumbnail: {report['scanned']} scanned, "
+                f"{report['reuploaded']} reuploaded, {report['failed']} failed"
+            )
+    return report
+
+
+def _format_bulk_report(title, report):
+    lines = [
+        f"✅ {title}",
+        f"Channel: {report.get('channel', '')}",
+        f"Scanned: {report.get('scanned', 0)}",
+    ]
+    if "changed" in report:
+        lines.extend([
+            f"Changed: {report.get('changed', 0)}",
+            f"Skipped: {report.get('skipped', 0)}",
+        ])
+    if "reuploaded" in report:
+        lines.extend([
+            f"Videos re-uploaded: {report.get('reuploaded', 0)}",
+            f"Non-video skipped: {report.get('skipped', 0)}",
+            "Original videos retained: yes",
+        ])
+    lines.append(f"Failed: {report.get('failed', 0)}")
+    errors = report.get("errors") or []
+    if errors:
+        lines.append("Errors: " + ", ".join(errors[:5]))
+    return "\n".join(lines)
+
+
+async def _reply_bulk_report(reply, title, operation, channel_input, value):
+    try:
+        report = await _edit_channel_messages(channel_input, operation, value)
+        text = _format_bulk_report(title, report)
+    except Exception as error:
+        text = f"❌ {title} failed: {type(error).__name__}: {error}"
+    await reply(text)
+
+
+async def _reply_thumbnail_report(reply, channel_input, thumbnail_path):
+    try:
+        report = await _reupload_video_thumbnails(channel_input, thumbnail_path)
+        text = _format_bulk_report("Video thumbnail operation complete", report)
+    except Exception as error:
+        text = f"❌ Video thumbnail operation failed: {type(error).__name__}: {error}"
+    await reply(text)
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.backup$"))
+async def cmd_backup(event):
+    if not is_owner(event.sender_id):
+        return
+    await event.edit("💾 Telegram backup upload ho raha hai...")
+    ok = await upload_state_backup(force=True)
+    await event.edit(
+        "✅ Latest state backup Telegram channel mein upload ho gaya."
+        if ok else "❌ Backup upload nahi ho saka. Logs check karo."
+    )
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.editcaptions\s+(\S+)\s+([\s\S]+)$"))
+async def cmd_editcaptions(event):
+    if not is_owner(event.sender_id):
+        return
+    channel_input = event.pattern_match.group(1)
+    template = event.pattern_match.group(2).strip()
+    template_error = _caption_template_error(template)
+    if template_error:
+        await event.edit(f"❌ {template_error}")
+        return
+    await event.edit("✏️ Channel captions edit ho rahe hain...")
+    asyncio.create_task(_reply_bulk_report(
+        event.edit, "Channel caption edit complete", "caption", channel_input, template
+    ))
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.mark\s+(\S+)\s+(header|footer)\s+([\s\S]+)$"))
+async def cmd_mark(event):
+    if not is_owner(event.sender_id):
+        return
+    channel_input = event.pattern_match.group(1)
+    operation = event.pattern_match.group(2).lower()
+    value = event.pattern_match.group(3).strip()
+    await event.edit(f"🏷️ {operation.title()} channel ke messages par add ho raha hai...")
+    asyncio.create_task(_reply_bulk_report(
+        event.edit, f"Channel {operation} operation complete",
+        operation, channel_input, value
+    ))
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.videothumbnail\s+(\S+)$"))
+async def cmd_videothumbnail(event):
+    if not is_owner(event.sender_id):
+        return
+    if not event.is_reply:
+        await event.edit("❌ Is command ko photo/image ke reply mein bhejo.")
+        return
+    channel_input = event.pattern_match.group(1)
+    replied = await event.get_reply_message()
+    if not replied or not replied.media:
+        await event.edit("❌ Replied message mein valid photo/image required hai.")
+        return
+    THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+    raw_path = THUMBNAIL_DIR / f".bulk_{uuid.uuid4().hex}.upload"
+    path = THUMBNAIL_DIR / f"bulk_{uuid.uuid4().hex}.jpg"
+    processed_path = None
+    try:
+        downloaded = await client.download_media(replied.media, file=str(raw_path))
+        if not downloaded:
+            raise RuntimeError("Thumbnail download failed")
+        processed_path = _prepare_thumbnail(raw_path)
+        processed_path.replace(path)
+        await event.edit(
+            "🖼️ Video thumbnails update ho rahe hain. Originals delete nahi honge..."
+        )
+        await _reply_thumbnail_report(event.edit, channel_input, path)
+    except Exception as error:
+        await event.edit(f"❌ Thumbnail process nahi ho saka: {type(error).__name__}: {error}")
+    finally:
+        raw_path.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+        if processed_path and processed_path.exists() and processed_path != path:
+            processed_path.unlink(missing_ok=True)
 
 
 # ════════════════════════════════════════════════════════
@@ -2343,19 +2804,28 @@ async def bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not state.get("running"):
         stats = state.get("stats", reset_stats())
         await update.message.reply_text(
-            f"🔴 *Not Running*\n\nLast session stats:\n{stats_text(stats)}",
+            f"🔴 *Not Running*\n\n"
+            f"Source status: {state.get('source_status', 'Idle')}\n"
+            f"Transferred: `{state.get('transfer_count', state.get('current_id', 0))}`\n"
+            f"Duplicates: `{stats.get('duplicates', 0)}`\n\n"
+            f"Last session stats:\n{stats_text(stats)}",
             parse_mode="Markdown"
         )
         return
     stats = state.get("stats", reset_stats())
-    current = state.get("current_id", 0)
+    current = state.get("scanned_msgs", state.get("current_id", 0))
     total = state.get("total_msgs", 0)
     paused = "⏸️ Paused" if state.get("paused") else "🟢 Running"
     pct = f"{(current/total*100):.1f}%" if total else "?"
     await update.message.reply_text(
         f"📊 *Live Status*\n\n"
+        f"Source: `{state.get('source_title', 'Not set')}`\n"
+        f"Source status: {state.get('source_status', 'Scanning')}\n"
         f"State: {paused}\n"
-        f"Progress: `{current}/{total}` ({pct})\n\n"
+        f"Pending: `{max(total - current, 0)}`\n"
+        f"Transferred: `{state.get('transfer_count', state.get('current_id', 0))}`\n"
+        f"Duplicates: `{stats.get('duplicates', 0)}`\n"
+        f"Scanned: `{current}/{total}` ({pct})\n\n"
         f"{stats_text(stats)}",
         parse_mode="Markdown"
     )
@@ -2441,8 +2911,11 @@ async def bot_synclast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bot_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
         return
-    msg = await update.message.reply_text("🔄 Source refresh ho raha hai...")
-    asyncio.create_task(refresh_sources(msg, is_bot=True))
+    task_id = context.args[0] if context.args else None
+    msg = await update.message.reply_text(
+        f"🔄 {'Task ' + task_id + ' ka ' if task_id else ''}source full rescan ho raha hai..."
+    )
+    asyncio.create_task(refresh_sources(msg, is_bot=True, task_id=task_id))
 
 
 async def bot_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2482,6 +2955,102 @@ async def bot_autoforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Auto-forward {'ON' if enabled else 'OFF'} kar diya.\n"
         "New posts direct copy honge; restricted post par download/upload fallback hoga."
     )
+
+
+async def bot_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    await update.message.reply_text("💾 Telegram backup upload ho raha hai...")
+    ok = await upload_state_backup(force=True)
+    await update.message.reply_text(
+        "✅ Latest state backup upload ho gaya."
+        if ok else "❌ Backup upload nahi ho saka. Logs check karo."
+    )
+
+
+async def bot_editcaptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /editcaptions <channel> <caption template>\n"
+            "Placeholders: {caption} {filename} {message_id} {type} {filesize}"
+        )
+        return
+    channel_input = context.args[0]
+    template = " ".join(context.args[1:]).strip()
+    template_error = _caption_template_error(template)
+    if template_error:
+        await update.message.reply_text(f"❌ {template_error}")
+        return
+    await update.message.reply_text("✏️ Channel ke file captions edit ho rahe hain...")
+    asyncio.create_task(_reply_bulk_report(
+        update.message.reply_text, "Channel caption edit complete",
+        "caption", channel_input, template
+    ))
+
+
+async def bot_mark(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    if len(context.args) < 3 or context.args[1].lower() not in {"header", "footer"}:
+        await update.message.reply_text(
+            "Usage: /mark <channel> header|footer <text>"
+        )
+        return
+    channel_input = context.args[0]
+    operation = context.args[1].lower()
+    value = " ".join(context.args[2:]).strip()
+    await update.message.reply_text(
+        f"🏷️ {operation.title()} channel ke messages par add ho raha hai..."
+    )
+    asyncio.create_task(_reply_bulk_report(
+        update.message.reply_text, f"Channel {operation} operation complete",
+        operation, channel_input, value
+    ))
+
+
+async def bot_videothumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: image ko reply karke /videothumbnail <channel> bhejo."
+        )
+        return
+    replied = update.message.reply_to_message
+    photo = getattr(replied, "photo", None) if replied else None
+    document = getattr(replied, "document", None) if replied else None
+    image_document = document and str(getattr(document, "mime_type", "")).lower().startswith("image/")
+    if not replied or (not photo and not image_document):
+        await update.message.reply_text("❌ Command ko photo/image ke reply mein bhejo.")
+        return
+    THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+    raw_path = THUMBNAIL_DIR / f".bulk_{uuid.uuid4().hex}.upload"
+    path = THUMBNAIL_DIR / f"bulk_{uuid.uuid4().hex}.jpg"
+    processed_path = None
+    try:
+        file_id = photo[-1].file_id if photo else document.file_id
+        tg_file = await context.bot.get_file(file_id)
+        await tg_file.download_to_drive(custom_path=str(raw_path))
+        processed_path = _prepare_thumbnail(raw_path)
+        processed_path.replace(path)
+        await update.message.reply_text(
+            "🖼️ Video thumbnails update ho rahe hain. Originals delete nahi honge..."
+        )
+        report = await _reupload_video_thumbnails(context.args[0], path)
+        await update.message.reply_text(
+            _format_bulk_report("Video thumbnail operation complete", report)
+        )
+    except Exception as error:
+        await update.message.reply_text(
+            f"❌ Thumbnail process nahi ho saka: {type(error).__name__}: {error}"
+        )
+    finally:
+        raw_path.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+        if processed_path and processed_path.exists() and processed_path != path:
+            processed_path.unlink(missing_ok=True)
 
 
 # ════════════════════════════════════════════════════════
@@ -2611,6 +3180,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
         count   = 0
         failed  = 0
         stats   = reset_stats()
+        scanned = 0
         _last_edit = 0   # throttle edit calls (max 1 per sec)
         handled_albums = set()
         oversized_album_message_ids = set()
@@ -2732,6 +3302,9 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             limit=effective_limit,
             max_id=max_id or None
         ):
+            scanned += 1
+            state["scanned_msgs"] = scanned
+            state["source_status"] = f"Scanning ({scanned}/{total_count})"
             state.setdefault("source_last_ids", {})[str(pair_id)] = message.id
             controls = state.setdefault("task_controls", {})
             control = controls.setdefault(task_id or "legacy", {"paused": False, "cancelled": False})
@@ -2760,10 +3333,13 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         continue
                     handled_albums.add(grouped_id)
                     album = [item for item in album if _message_allowed(item, config)]
-                    album = [
-                        item for item in album
-                        if not _is_duplicate(pair_id, item)
+                    duplicate_album_items = [
+                        item for item in album if _is_duplicate(pair_id, item)
                     ]
+                    if duplicate_album_items:
+                        stats["duplicates"] = stats.get("duplicates", 0) + len(duplicate_album_items)
+                        state["stats"] = stats
+                    album = [item for item in album if item not in duplicate_album_items]
                     if album:
                         if force_sync:
                             sendable_album = album
@@ -2855,12 +3431,16 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             if not _message_allowed(message, config):
                 stats = state.get("stats", stats)
                 stats["skipped"] = stats.get("skipped", 0) + 1
+                state["stats"] = stats
+                _dashboard_changed()
                 _log_live(f"⏭️ Filter skipped ID={message.id}")
                 continue
             dedupe = state.setdefault("dedupe", {})
             dkey = _dedupe_key(pair_id, message)
             if _is_duplicate(pair_id, message):
                 stats["duplicates"] = stats.get("duplicates", 0) + 1
+                state["stats"] = stats
+                _dashboard_changed()
                 _log_live(f"⏭️ Duplicate skipped ID={message.id}")
                 continue
             budget_ok, budget_bucket, permanently_oversized = (
@@ -3039,6 +3619,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                     _hourly_budget(pair_id, config, commit=True)
                     state["last_synced_id"] = message.id
                     state["current_id"]     = count
+                    state["transfer_count"]  = count
                     state["stats"]          = stats
                     state.pop("transfer", None)   # clear transfer card
                     save_state(state)
@@ -3194,6 +3775,8 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
         elapsed_total = time.time() - start_time
         state["running"] = False
         state["stats"]   = stats
+        state["scanned_msgs"] = max(scanned, total_count)
+        state["source_status"] = "Complete"
         state.pop("transfer", None)
         save_state(state)
         _log_live(
@@ -3920,6 +4503,11 @@ def _status_payload():
         "current": cur,
         "total":   tot,
         "pct":     round(cur / tot * 100, 1) if tot else 0,
+        "scanned": state.get("scanned_msgs", cur),
+        "pending": max(tot - state.get("scanned_msgs", cur), 0),
+        "transferred": state.get("transfer_count", cur),
+        "duplicates": stats.get("duplicates", 0),
+        "source_status": state.get("source_status", "Idle"),
         "stats":   stats,
         "auto_forward": bool(state.get("auto_forward")),
         "auto_stats": state.get("auto_stats", {"sent": 0, "failed": 0}),
@@ -3940,6 +4528,7 @@ def _status_payload():
             "database_file": STATE_DB_FILE,
             "backup_available": Path(STATE_BACKUP_FILE).exists(),
         },
+        "backup_channel": state.get("backup_channel", DEFAULT_BACKUP_CHANNEL),
         "pair_health": state.get("health", {}),
         "oversized_messages": state.get("oversized_messages", [])[-20:],
         "templates": state.get("templates", {}),
@@ -4675,6 +5264,8 @@ async def main():
     # Start Telethon userbot
     await client.start(phone=PHONE)
     persist_session_string()
+    if not _LOCAL_STATE_PRESENT:
+        await restore_latest_backup()
     me = await client.get_me()
     print(f"✅ Userbot logged in as: {me.first_name} (@{me.username})")
     print(f"🔐 Owner ID: {OWNER_ID}")
@@ -4713,8 +5304,12 @@ async def main():
     app.add_handler(CommandHandler("refresh", bot_refresh))
     app.add_handler(CommandHandler("tasks", bot_tasks))
     app.add_handler(CommandHandler("autoforward", bot_autoforward))
+    app.add_handler(CommandHandler("backup", bot_backup))
     app.add_handler(CommandHandler("caption", bot_caption))
     app.add_handler(CommandHandler("setthumbnail", bot_setthumbnail))
+    app.add_handler(CommandHandler("editcaptions", bot_editcaptions))
+    app.add_handler(CommandHandler("mark", bot_mark))
+    app.add_handler(CommandHandler("videothumbnail", bot_videothumbnail))
     app.add_handler(CallbackQueryHandler(bot_help_callback, pattern=r"^help:"))
     app.add_handler(CallbackQueryHandler(bot_continue_callback, pattern=r"^continue:"))
 

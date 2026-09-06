@@ -215,6 +215,11 @@ Userbot account se bheje gaye commands dot prefix use karte hain. Sirf
 | `.sync` | Full sync |
 | `.syncfrom <id>` | Given message ID se sync |
 | `.synclast <n>` | Last N messages sync |
+| `.refresh [task_id]` | Full source rescan; existing copies duplicate count ke saath skip |
+| `.backup` | Current state ka JSON backup Telegram backup channel mein upload |
+| `.editcaptions <channel> <template>` | Channel ke media/file captions bulk edit |
+| `.mark <channel> header\|footer <text>` | Har message par header ya footer add |
+| `.videothumbnail <channel>` | Replied image se videos re-upload with thumbnail; originals retain |
 | `.pause` | Running sync pause |
 | `.resume` | Paused sync resume |
 | `.stop` | Sync stop |
@@ -236,12 +241,17 @@ owner-only hain.
 | `/sync` | Full sync |
 | `/syncfrom <id>` | Message ID se sync |
 | `/synclast <n>` | Last N messages sync |
+| `/refresh [task_id]` | Full source rescan; existing copies duplicate count ke saath skip |
 | `/tasks` | Task queue |
 | `/autoforward on` | New source posts auto-copy enable |
 | `/autoforward off` | Auto-forward disable |
 | `/caption <pair_id> on\|off [template]` | Pair caption changer |
 | `/setthumbnail <pair_id>` | Replied photo ko video thumbnail set karo |
 | `/setthumbnail <pair_id> off` | Thumbnail disable |
+| `/backup` | Current state ka JSON backup Telegram backup channel mein upload |
+| `/editcaptions <channel> <template>` | Channel ke media/file captions bulk edit |
+| `/mark <channel> header\|footer <text>` | Har message par header ya footer add |
+| `/videothumbnail <channel>` | Replied image se videos re-upload with thumbnail; originals retain |
 | `/pause` | Sync pause |
 | `/resume` | Sync resume |
 | `/stop` | Sync stop |
@@ -272,6 +282,7 @@ Dashboard mein ye panels/actions available hain:
 - Pause, resume aur stop
 - Task queue, priority, reorder, bulk actions aur reports
 - Live progress aur media statistics
+- Live source status, scanned/pending/transferred/duplicate counters; dashboard events throttled hain
 - Channel health
 - Temporary storage usage aur cleanup
 - Searchable live logs
@@ -324,10 +335,14 @@ Dashboard same-origin Flask API use karta hai. Important endpoints:
 Is project mein PostgreSQL tables use nahi ho rahe; configuration aur progress
 JSON state file mein persist hote hain. Har state save se pehle previous valid
 file `sync_state.json.bak` mein rakhi jaati hai, aur startup par damaged main
-file se automatic recovery hoti hai. New hosting par `sync_state.json` ko saath
-copy/restore karein; ismein source, target, pairs, tasks aur dedupe state hoti
-hai, lekin Telegram secrets nahi. `sync_state.json`, uska backup, `sync.log`
-aur `thumbnails/` ko untrusted users ke saath share na karein.
+file se automatic recovery hoti hai. First startup par bot configured Telegram
+backup channel (`-1003941432857`) ke latest JSON backup ko restore karta hai,
+agar local state pehle se available nahi hai. Completed sync ke baad backup
+upload throttle ke saath hota hai; manual `/backup` ya `.backup` se force kiya
+ja sakta hai. New hosting par `sync_state.json` ko saath copy/restore karein;
+ismein source, target, pairs, tasks aur dedupe state hoti hai, lekin Telegram
+secrets nahi. `sync_state.json`, uska backup, `sync.log` aur `thumbnails/` ko
+untrusted users ke saath share na karein.
 
 ## Troubleshooting
 

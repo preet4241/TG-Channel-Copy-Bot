@@ -7,8 +7,8 @@
 </section>
 <section class="metric-grid">
   <div class="metric-card accent-blue"><span class="metric-label">Messages copied</span><strong id="dash-copied">—</strong><small>Current run</small></div>
-  <div class="metric-card accent-red"><span class="metric-label">Failed</span><strong id="dash-failed">—</strong><small>Needs attention</small></div>
-  <div class="metric-card accent-violet"><span class="metric-label">Progress</span><strong id="dash-progress">—</strong><small id="dash-progress-note">Current task</small></div>
+  <div class="metric-card accent-red"><span class="metric-label">Duplicates</span><strong id="dash-duplicates">—</strong><small>Already present</small></div>
+  <div class="metric-card accent-violet"><span class="metric-label">Pending</span><strong id="dash-pending">—</strong><small id="dash-progress-note">Source messages left</small></div>
   <div class="metric-card accent-green"><span class="metric-label">Active pairs</span><strong id="dash-pairs">—</strong><small>Configured routes</small></div>
 </section>
 <div class="dashboard-grid">
@@ -16,6 +16,8 @@
     <div class="section-header"><div><p class="eyebrow">Now running</p><h2>Live progress</h2></div><span id="dash-run-status" class="status-pill neutral">Stopped</span></div>
     <div class="progress-summary"><strong id="dash-progress-count">0 / 0</strong><span id="dash-last-sync">Last synced ID —</span></div>
     <div class="progress-track"><span id="dash-progress-bar"></span></div>
+    <div class="split-meta"><span>Source status</span><strong id="dash-source-status">Idle</strong></div>
+    <div class="split-meta"><span>Transferred</span><strong id="dash-transferred">0</strong></div>
     <div class="split-meta"><span>Transfer status</span><strong id="dash-transfer">Waiting for a task</strong></div>
     <div class="quick-actions"><a class="quick-action" href="/tasks"><span>→</span><div><strong>Review task queue</strong><small>Open, pause, or continue a task</small></div></a><a class="quick-action" href="/settings"><span>•••</span><div><strong>Global behavior</strong><small>Control alerts and defaults</small></div></a></div>
   </section>
