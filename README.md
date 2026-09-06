@@ -1,102 +1,290 @@
-# TG Channel Copy Bot — Archive Bot
+# Telegram Channel Archive Bot
 
-## By PR
+Owner-only Telegram archive and channel-copy bot. It can copy channel history,
+keep source-to-target routes, resume interrupted work, detect duplicates, and
+manage bulk caption, marking, backup, and thumbnail operations.
 
+The project runs three pieces in one Python process:
 
-Telegram channels ke messages ko source channel se target channel mein safely copy
-karne wala owner-only archive bot. Project ek hi Python process mein:
+- **Telethon userbot** — reads source channels and transfers media.
+- **Telegram Bot API controller** — accepts owner commands and sends alerts.
+- **Flask dashboard** — manages pairs, tasks, limits, logs, and live progress.
 
-- **Telethon userbot** — channel access, message reading aur media transfer
-- **Telegram Bot API controller** — remote commands aur notifications
-- **Flask dashboard** — live monitoring, pair management aur task controls
+## Contents
 
-Forward headers ke bina copy karne ki koshish hoti hai. Protected content ya
-custom caption/thumbnail wale messages download karke target par upload hote hain.
+- [What it does](#what-it-does)
+- [Run locally or on Replit](#run-locally-or-on-replit)
+- [First-time setup](#first-time-setup)
+- [Commands](#commands)
+- [Bulk operation safety](#bulk-operation-safety)
+- [Caption templates](#caption-templates)
+- [Dashboard](#dashboard)
+- [Backup and restore](#backup-and-restore)
+- [Files and storage](#files-and-storage)
+- [HTTP API](#http-api)
+- [Troubleshooting](#troubleshooting)
+- [Security](#security)
 
-## Features
+## What it does
 
 ### Channel copying
 
-- Full sync, message ID se sync, ya last N messages sync
-- Source aur target channel ke liye:
-  - `@username`
-  - Telegram channel ID (`-100...`)
-  - numeric ID
-  - `t.me` / `telegram.me` link
-  - forwarded message se private channel detection
-- Text, photos, videos, documents, audio aur other media support
-- Albums ko grouped upload ke roop mein preserve karne ki koshish
-- Original filenames, document attributes, video streaming aur audio metadata
-  preserve kiye jaate hain
-- Protected-content policy:
-  - **Download and upload** — protected media ko re-upload karo
-  - **Skip** — protected message ko skip karo aur log karo
-- Failed transfers ke liye error details aur available Telegram message link
+- Full history sync, sync from a message ID, or sync the last N messages.
+- Multiple independent source → target channel pairs.
+- Channel references by `@username`, `-100...` ID, numeric ID, Telegram link,
+  or a forwarded message for private channels.
+- Text, photos, videos, documents, audio, GIFs, voice messages, and other
+  supported Telegram media.
+- Album/grouped-media upload where Telegram allows it.
+- Original filenames, document attributes, video streaming, and audio metadata
+  are preserved when possible.
+- Protected-content policy can either download/re-upload the post or skip it.
+- Failed transfers are recorded with error details and an available message link.
 
-### Strong duplicate detection
+### Duplicate protection
 
-Bot duplicate messages ko multiple identities ke basis par detect karta hai:
+The bot uses more than one identity when deciding whether a message was already
+copied:
 
-- Source message ID mapping
-- Stable text identity
-- Media fingerprint using Telegram document/photo metadata
-- Pair-specific dedupe records
-- Dashboard se **Copy again** action, jo selected pair ki dedupe identities
-  clear karta hai
+- Source message ID mapping.
+- Stable text identity.
+- Telegram document/photo metadata fingerprint.
+- Pair-specific dedupe records.
 
-### Per-pair rules
+The dashboard also provides a **Copy again** action that clears dedupe
+identities for a selected pair.
 
-Har source → target pair ki independent settings hoti hain:
+### Pair-level rules
 
-- Pair name
-- Allowed message types
-- Include keywords
-- Exclude keywords
-- Caption prefix aur suffix
-- Link removal
-- Source-name removal
-- Rate profile aur custom delay
-- Per-run maximum messages
-- Daily message limit
-- Daily media limit
-- Schedule window
-- Quiet hours
-- Maximum posts per hour
-- Protected-content behavior
-- Caption changer
-- Video thumbnail changer
+Each source → target pair can have its own:
 
-### Caption changer
+- Allowed message types.
+- Include and exclude keyword filters.
+- Caption prefix, suffix, and caption-removal rules.
+- Caption template and parse mode.
+- Video thumbnail.
+- Rate profile or custom delay.
+- Per-run and daily message/media limits.
+- Maximum posts per hour.
+- Schedule window and quiet hours.
+- Protected-content behavior.
+- Auto-forward setting.
 
-Caption changer per pair enable/disable kiya ja sakta hai. Caption ko selected
-message types par apply kiya ja sakta hai:
+### Live monitoring
 
-- Text
-- Photo
-- Video
-- Document
-- Other
+The dashboard and status commands expose:
 
-Supported formatting modes:
+- Source status.
+- Scanned, pending, transferred, duplicate, skipped, and failed counts.
+- Current transfer and task queue state.
+- Channel access and target write-permission health.
+- FloodWait and storage-limit warnings.
+- Searchable live logs.
+- Temporary storage usage and cleanup.
 
-- Markdown
-- HTML
-- Plain text
+## Run locally or on Replit
 
-Template placeholders:
+### Requirements
+
+- Python 3.12 recommended.
+- A Telegram account with access to the source channel.
+- Posting permission in the target channel.
+- Dependencies from `requirements.txt`.
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Start the application:
+
+```bash
+python main.py
+```
+
+On Replit, the configured **Start application** workflow runs the same command.
+The Flask dashboard listens on `PORT` and normally uses port `8080` locally.
+
+## Required Replit Secrets
+
+Set these in Replit Secrets. Never paste them into source code, README files, or
+chat messages.
+
+| Secret | Purpose |
+|---|---|
+| `API_ID` | Telegram API ID from `my.telegram.org` |
+| `API_HASH` | Telegram API hash |
+| `PHONE` | Telethon user account phone number |
+| `OWNER_ID` | Numeric Telegram user ID allowed to control the bot |
+| `BOT_TOKEN` | BotFather token |
+| `DASHBOARD_PASSWORD` | Password for the Flask dashboard |
+
+Optional values:
+
+| Variable | Purpose |
+|---|---|
+| `SESSION_STRING` | Reuse an existing Telethon session |
+| `FLASK_SECRET_KEY` | Keep dashboard sessions valid across restarts |
+| `PORT` | Dashboard port; Replit supplies this automatically |
+
+After a successful login, the Telethon session is persisted locally in
+`session_string.txt`. Keep that file private.
+
+## First-time setup
+
+1. Add the required Replit Secrets.
+2. Start `python main.py` and complete the Telethon login if requested.
+3. Open the dashboard and sign in with `DASHBOARD_PASSWORD`.
+4. Set a source channel and target channel.
+5. Create a source → target pair.
+6. Configure message types, filters, caption rules, thumbnail, and limits.
+7. Run **Dry run** first to review the estimated messages and duplicates.
+8. Start the sync and monitor live progress and logs.
+9. Enable auto-forward only after the initial history sync is behaving correctly.
+
+## Commands
+
+Commands are owner-only. Use slash commands through the Telegram Bot API bot,
+or the equivalent dot commands from the logged-in Telethon userbot.
+
+### Userbot commands
+
+| Command | Description |
+|---|---|
+| `.help` | Open the interactive category help menu. |
+| `.helpfile` | Receive the complete command guide as `archive_bot_commands.txt`. |
+| `.setsource <channel>` | Set the source channel. |
+| `.settarget <channel>` | Set the target channel. |
+| `.info` | Show current source, target, pairs, and configuration. |
+| `.sync` | Queue a full sync. |
+| `.syncfrom <id>` | Queue a sync starting from a source message ID. |
+| `.synclast <n>` | Queue the last N source messages. |
+| `.refresh [task_id]` | Rescan the complete source history; existing copies are counted as duplicates. |
+| `.backup` | Upload the current state snapshot to the Telegram backup channel. |
+| `.status` | Show live or last-sync status. |
+| `.pause` | Pause the active sync. |
+| `.resume` | Resume a paused sync. |
+| `.stop` | Stop active and queued sync work. |
+| `.reset` | Reset runtime configuration to defaults. |
+| `.cancel` | Cancel a pending caption prompt. |
+
+For private channels, `.setsource` and `.settarget` can also use a forwarded
+message when an ID or username is not available.
+
+### Telegram bot commands
+
+| Command | Description |
+|---|---|
+| `/start` | Show a short bot introduction. |
+| `/help` | Open the interactive category help menu. |
+| `/helpfile` | Receive the complete command guide as a TXT file. |
+| `/setsource <channel>` | Set the source channel. |
+| `/settarget <channel>` | Set the target channel. |
+| `/info` | Show current configuration. |
+| `/status` | Show live or last-sync status. |
+| `/sync` | Queue a full sync. |
+| `/force_sync` | Queue a full sync while bypassing normal daily limits. Use carefully. |
+| `/syncfrom <id>` | Queue a sync starting from a message ID. |
+| `/synclast <n>` | Queue the last N messages. |
+| `/refresh [task_id]` | Rescan the complete source history. |
+| `/tasks` | Show the task queue. |
+| `/autoforward on\|off` | Enable or disable global auto-forwarding. |
+| `/caption <pair_id> on\|off [template]` | Configure a pair caption rule. |
+| `/setthumbnail <pair_id>` | Save a replied photo as a pair video thumbnail. |
+| `/setthumbnail <pair_id> off` | Disable a pair thumbnail. |
+| `/backup` | Upload the current state snapshot. |
+| `/editcaptions <channel> [template]` | Bulk-edit captions in an existing channel. |
+| `/mark <channel> header\|footer <text>` | Add a header or footer to channel messages. |
+| `/videothumbnail <channel>` | Re-upload channel videos with a replied image as thumbnail. |
+| `/cancel` | Cancel a pending caption prompt. |
+| `/pause`, `/resume`, `/stop` | Control active sync work. |
+| `/reset` | Reset runtime configuration to defaults. |
+
+### Bulk caption editing
+
+The caption template can be supplied in any of these ways:
+
+```text
+/editcaptions @channel 🎬 {filename}
+```
+
+Reply to a message containing the desired caption and send:
+
+```text
+/editcaptions @channel
+```
+
+Or send only the channel. The bot will ask for the caption in your next
+message:
+
+```text
+/editcaptions @channel
+```
+
+The same three flows work with `.editcaptions`. Use `/cancel` or `.cancel` if
+you change your mind. Bulk caption editing changes captions in place; it skips
+messages without editable media and does not delete messages.
+
+### Bulk marking
+
+```text
+/mark @channel header 📚 Archive
+/mark @channel footer — Saved by Archive Bot
+```
+
+The same syntax works with `.mark`. Repeating the command adds the mark again,
+so review the first report before running it a second time.
+
+### Bulk video thumbnails
+
+Reply to a photo or image document:
+
+```text
+/videothumbnail @channel
+```
+
+The same syntax works with `.videothumbnail`. Telegram does not provide a safe
+in-place thumbnail edit for an existing video post, so the bot uploads
+replacement videos and retains the original posts. Repeating this operation
+creates another set of replacements.
+
+## Bulk operation safety
+
+Bulk operations are deliberately slower than a normal loop:
+
+- **3 seconds** after every Telegram API action.
+- An additional **10-second pause** after every 10 actions.
+- `FloodWait` and `SlowMode` use Telegram's suggested wait plus a 5-second
+  safety margin.
+- A limited action is retried up to three times.
+- The final report shows scanned, changed/re-uploaded, skipped, and failed
+  counts, plus the first errors.
+
+FloodWait can still be returned by Telegram when account or channel limits
+change, but the bot will wait and retry instead of hammering the API.
+
+Normal syncs additionally use each pair's rate profile, custom delay, daily
+quotas, hourly cap, schedule window, and quiet hours.
+
+## Caption templates
+
+Templates are supported by pair caption rules and bulk caption editing.
 
 | Placeholder | Value |
 |---|---|
-| `{caption}` | Original message text/caption |
-| `{filename}` | Document filename, if available |
+| `{caption}` | Original message text or caption |
+| `{filename}` | Document filename, when available |
 | `{filesize}` | Human-readable file size |
 | `{filesize_mb}` | File size in MB |
-| `{message_id}` | Source Telegram message ID |
+| `{message_id}` | Telegram message ID |
 | `{source}` | Source channel title |
 | `{date}` | Processing date (`YYYY-MM-DD`) |
 | `{time}` | Processing time (`HH:MM`) |
 | `{mime}` | Media MIME type |
 | `{type}` | Detected message type |
+| `{duration}` | Media duration, when available |
+| `{resolution}` | Video/photo resolution, when available |
 
 Example:
 
@@ -108,297 +296,156 @@ Source: {source}
 {caption}
 ```
 
-Invalid templates original caption par safely fall back karte hain. Caption
-customization direct-copy path ko bypass karke upload path use karti hai.
+Supported parse modes are Markdown, HTML, and plain text. Plain text is safest
+when source captions contain characters such as `*`, `_`, `[`, `<`, or `&`.
 
-### Video thumbnail changer
+## Dashboard
 
-- Thumbnail per pair enable/disable
-- Sirf videos par apply hota hai
-- Dashboard se image upload
-- Telegram Bot API se replied photo ko thumbnail set karna
-- JPEG, PNG aur WebP signature validation
-- Maximum thumbnail size: 20 MB
-- Pair delete karne par saved thumbnail cleanup
-- Temporary media aur thumbnails ko source channel se permanently link nahi kiya
-  jaata
+The dashboard provides:
 
-### Safety, limits aur resilience
+- Source and target channel configuration.
+- Pair create, edit, and delete.
+- Message-type and keyword filters.
+- Rate, quota, schedule, and quiet-hour controls.
+- Caption template, parse mode, and selected caption types.
+- Per-pair thumbnail upload and removal.
+- Auto-forward controls.
+- Full sync, sync-from-ID, last-N sync, and dry-run preview.
+- Pause, resume, stop, queue priority, reorder, and bulk task actions.
+- Task reports, searchable logs, live status, and channel health.
+- Temporary storage usage and cleanup.
+- Pair dedupe reset for a deliberate copy-again operation.
 
-- Temporary downloads `/tmp/archive_bot` mein store hote hain
-- Hard temporary storage budget: **1.8 GB**
-- Download se pehle size/quota check
-- Upload ke baad temporary files cleanup
-- Dashboard se leftover temporary files cleanup
-- Safe rate limiting aur Telegram `FloodWait` handling
-- FloodWait warnings aur task failure notifications
-- Storage-limit failure alerts
-- Daily message/media quotas
-- Source accessibility health
-- Target write permission health
-- Forwarding-protection status
-- Telegram session connection status
-- Last successful sync aur last error details
-- Owner-only userbot aur Bot API controls
-- Live dashboard updates Server-Sent Events ke through
+Important dashboard routes:
 
-## Requirements
-
-- Python 3.12 recommended
-- Telegram account with access to the source channel
-- Target channel mein posting permission
-- Packages listed in `requirements.txt`
-
-Install:
-
-```bash
-pip install -r requirements.txt
-```
-
-## Replit setup
-
-Replit Secrets mein ye values add karein:
-
-| Secret | Description |
+| Page | Purpose |
 |---|---|
-| `API_ID` | Telegram API ID from my.telegram.org |
-| `API_HASH` | Telegram API hash |
-| `PHONE` | Telethon user account phone number |
-| `OWNER_ID` | Authorized Telegram owner numeric user ID |
-| `BOT_TOKEN` | BotFather se Telegram bot token |
+| `/dashboard` | Live overview and current task |
+| `/pairs` | Source → target pair management |
+| `/tasks` | Queue, task reports, and task controls |
+| `/settings` | Global limits, notifications, and behavior |
+| `/help` | Browser-based command and formatting guide |
 
-Secrets ko source code, logs ya README mein paste na karein.
+## Backup and restore
 
-First successful login ke baad Telethon session `session_string.txt` mein
-persist hota hai. Is file ko public repository mein commit na karein.
+The bot uses JSON state plus a local SQLite snapshot for runtime persistence.
+The state contains pairs, tasks, progress, configuration, and dedupe identities;
+it does not contain Telegram secrets.
 
-## Running
+- Backup channel: `-1003941432857`.
+- On first startup without local state, the newest matching JSON backup is
+  restored from that channel.
+- Completed or partially completed syncs upload a backup with a five-minute
+  throttle.
+- `/backup` and `.backup` force a current backup upload.
+- `sync_state.json.bak` is the previous valid local JSON snapshot and is used
+  for recovery if the main JSON file is damaged.
 
-Primary application workflow:
+## Files and storage
 
-```bash
-python main.py
-```
-
-Application Flask dashboard ko `PORT` par start karta hai. Replit mein local
-dashboard normally port `8080` par available hota hai. Workflow `Start
-application` userbot, Bot API controller aur dashboard ko saath run karta hai.
-
-## First-time usage
-
-1. Required Replit Secrets configure karein.
-2. `python main.py` run karein aur Telegram login complete hone dein.
-3. Dashboard open karein.
-4. Source aur target channels set karein.
-5. Source → target pair create karein.
-6. Pair rules configure karein.
-7. Optional caption template ya thumbnail upload karein.
-8. Pehle **Dry run** use karke filters aur limits verify karein.
-9. Sync task start karein.
-10. Channel Health, Live Progress, logs aur task report monitor karein.
-
-## Userbot commands
-
-Userbot account se bheje gaye commands dot prefix use karte hain. Sirf
-`OWNER_ID` authorized hai.
-
-| Command | Action |
+| Path | Purpose |
 |---|---|
-| `.help` | Command list |
-| `.helpfile` | Complete detailed command guide as TXT file |
-| `.setsource @username` | Source set |
-| `.setsource -100123...` | Source ID set |
-| `.setsource` | Replied forwarded message se source set |
-| `.settarget @username` | Target set |
-| `.settarget -100123...` | Target ID set |
-| `.settarget` | Replied forwarded message se target set |
-| `.info` | Channel information aur current config |
-| `.sync` | Full sync |
-| `.syncfrom <id>` | Given message ID se sync |
-| `.synclast <n>` | Last N messages sync |
-| `.refresh [task_id]` | Full source rescan; existing copies duplicate count ke saath skip |
-| `.backup` | Current state ka JSON backup Telegram backup channel mein upload |
-| `.editcaptions <channel> [template]` | Caption bulk edit; reply-based ya next-message caption prompt bhi |
-| `.mark <channel> header\|footer <text>` | Har message par header ya footer add |
-| `.videothumbnail <channel>` | Replied image se videos re-upload with thumbnail; originals retain |
-| `.pause` | Running sync pause |
-| `.resume` | Paused sync resume |
-| `.stop` | Sync stop |
-| `.status` | Live/last sync status |
-| `.reset` | Configuration reset |
+| `main.py` | Telethon, Bot API, Flask, sync, bulk-operation, and state logic |
+| `templates/` | Dashboard HTML templates |
+| `static/` | Dashboard JavaScript and styles |
+| `requirements.txt` | Python dependencies |
+| `sync_state.json` | Current JSON state |
+| `sync_state.json.bak` | Previous valid JSON state |
+| `archive_state.sqlite3` | Local SQLite snapshot |
+| `sync.log` | Detailed application log |
+| `session_string.txt` | Persisted Telethon session |
+| `thumbnails/` | Saved per-pair and temporary thumbnail files |
+| `/tmp/archive_bot/` | Temporary downloaded media |
 
-## Telegram bot commands
-
-BotFather bot ko message bhejte waqt slash commands use karein. Bot commands
-owner-only hain.
-
-| Command | Action |
-|---|---|
-| `/start` | Bot introduction |
-| `/help` | Command list |
-| `/helpfile` | Complete detailed command guide as TXT file |
-| `/setsource <channel>` | Source set |
-| `/settarget <channel>` | Target set |
-| `/info` | Current configuration |
-| `/sync` | Full sync |
-| `/syncfrom <id>` | Message ID se sync |
-| `/synclast <n>` | Last N messages sync |
-| `/refresh [task_id]` | Full source rescan; existing copies duplicate count ke saath skip |
-| `/tasks` | Task queue |
-| `/autoforward on` | New source posts auto-copy enable |
-| `/autoforward off` | Auto-forward disable |
-| `/caption <pair_id> on\|off [template]` | Pair caption changer |
-| `/setthumbnail <pair_id>` | Replied photo ko video thumbnail set karo |
-| `/setthumbnail <pair_id> off` | Thumbnail disable |
-| `/backup` | Current state ka JSON backup Telegram backup channel mein upload |
-| `/editcaptions <channel> [template]` | Caption bulk edit; reply-based ya next-message caption prompt bhi |
-| `/mark <channel> header\|footer <text>` | Har message par header ya footer add |
-| `/videothumbnail <channel>` | Replied image se videos re-upload with thumbnail; originals retain |
-| `/pause` | Sync pause |
-| `/resume` | Sync resume |
-| `/stop` | Sync stop |
-| `/status` | Live status |
-| `/reset` | Configuration reset |
-
-Caption command ke optional template mein placeholders use kiye ja sakte hain.
-Selected types command se set karne ke liye template se pehle example:
-
-```text
-/caption abc123 on types=video,doc 🎬 {filename} | {filesize}
-```
-
-## Dashboard capabilities
-
-Dashboard mein ye panels/actions available hain:
-
-- Source aur target channel configuration
-- Source → target pair create/edit/delete
-- Message-type filters
-- Keyword filters
-- Rate, quota aur schedule controls
-- Caption template, parse mode aur caption-type controls
-- Per-pair thumbnail image upload
-- Auto-forward enable/disable
-- Full sync, sync-from-ID aur last-N controls
-- Dry run
-- Pause, resume aur stop
-- Task queue, priority, reorder, bulk actions aur reports
-- Live progress aur media statistics
-- Live source status, scanned/pending/transferred/duplicate counters; dashboard events throttled hain
-- Channel health
-- Temporary storage usage aur cleanup
-- Searchable live logs
-- Duplicate identities clear karke copy-again
-
-Bulk channel commands 3-second per-action pacing, 10-action batch pause,
-FloodWait/SlowMode suggested wait plus retry, aur failed-item reporting use
-karte hain. Video thumbnail operation replacement videos banata hai aur
-originals retain karta hai.
+Temporary media is checked against a hard **1.8 GB** working budget before
+download and removed after upload. Use the dashboard cleanup action if an
+interrupted transfer leaves temporary files behind.
 
 ## HTTP API
 
-Dashboard same-origin Flask API use karta hai. Important endpoints:
+The dashboard uses same-origin Flask endpoints:
 
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/health` | GET | Health check |
-| `/api/status` | GET | Dashboard status |
+| `/api/status` | GET | Current dashboard status |
 | `/api/bootstrap` | GET | Initial dashboard data |
 | `/api/events` | GET | Live Server-Sent Events stream |
-| `/api/pairs` | GET/POST | Pair list/create |
-| `/api/pairs/<pair_id>` | PATCH/DELETE | Pair update/delete |
-| `/api/pairs/<pair_id>/thumbnail` | POST/DELETE | Thumbnail upload/remove |
-| `/api/pairs/<pair_id>/dedupe` | POST | Pair dedupe identities clear |
-| `/api/templates` | GET/POST/DELETE | Stored pair-rule templates |
-| `/api/storage/cleanup` | POST | Temporary files cleanup |
-| `/api/tasks` | GET/POST | List/create tasks |
-| `/api/tasks/dry-run` | POST | Filter preview |
-| `/api/tasks/<task_id>` | PATCH/DELETE | Task update/delete |
-| `/api/tasks/<task_id>/report` | GET | Task report; `?format=csv` for CSV |
-| `/api/tasks/bulk` | POST | Bulk task action |
-| `/api/tasks/reorder` | POST | Queue reorder |
-| `/api/sync` | POST | Full sync |
-| `/api/syncfrom` | POST | Sync from message ID |
-| `/api/synclast` | POST | Sync last N messages |
-| `/api/autoforward` | POST | Global auto-forward control |
-| `/api/pause` | POST | Pause |
-| `/api/resume` | POST | Resume |
-| `/api/stop` | POST | Stop |
-| `/api/reset` | POST | Reset |
-| `/api/logs` | GET | Live logs |
-| `/api/logs/search` | GET | Filter logs with `?q=...` |
-
-## Persistent files
-
-| File/path | Purpose |
-|---|---|
-| `sync_state.json` | Pair configuration, tasks, stats and dedupe state |
-| `sync_state.json.bak` | Previous valid state snapshot used if the main JSON file is damaged |
-| `sync.log` | Detailed application log |
-| `session_string.txt` | Persisted Telethon session |
-| `thumbnails/` | Per-pair thumbnail files |
-| `/tmp/archive_bot/` | Temporary downloaded media |
-
-Is project mein PostgreSQL tables use nahi ho rahe; configuration aur progress
-JSON state file mein persist hote hain. Har state save se pehle previous valid
-file `sync_state.json.bak` mein rakhi jaati hai, aur startup par damaged main
-file se automatic recovery hoti hai. First startup par bot configured Telegram
-backup channel (`-1003941432857`) ke latest JSON backup ko restore karta hai,
-agar local state pehle se available nahi hai. Completed sync ke baad backup
-upload throttle ke saath hota hai; manual `/backup` ya `.backup` se force kiya
-ja sakta hai. New hosting par `sync_state.json` ko saath copy/restore karein;
-ismein source, target, pairs, tasks aur dedupe state hoti hai, lekin Telegram
-secrets nahi. `sync_state.json`, uska backup, `sync.log` aur `thumbnails/` ko
-untrusted users ke saath share na karein.
+| `/api/pairs` | GET/POST | List or create pairs |
+| `/api/pairs/<pair_id>` | PATCH/DELETE | Update or delete a pair |
+| `/api/pairs/<pair_id>/thumbnail` | POST/DELETE | Add or remove a thumbnail |
+| `/api/pairs/<pair_id>/dedupe` | POST | Clear pair dedupe identities |
+| `/api/tasks` | GET/POST | List or create tasks |
+| `/api/tasks/<task_id>` | PATCH/DELETE | Update or delete a task |
+| `/api/tasks/<task_id>/report` | GET | View a task report; use `?format=csv` for CSV |
+| `/api/tasks/bulk` | POST | Apply a bulk queue action |
+| `/api/tasks/reorder` | POST | Reorder queued tasks |
+| `/api/tasks/dry-run` | POST | Preview filters and duplicates |
+| `/api/sync` | POST | Start a full sync |
+| `/api/syncfrom` | POST | Start from a message ID |
+| `/api/synclast` | POST | Sync the last N messages |
+| `/api/autoforward` | POST | Toggle global auto-forwarding |
+| `/api/pause`, `/api/resume`, `/api/stop` | POST | Control sync work |
+| `/api/reset` | POST | Reset runtime state |
+| `/api/logs` | GET | Read live logs |
+| `/api/logs/search` | GET | Search live logs with `?q=...` |
 
 ## Troubleshooting
 
-### Dashboard open nahi ho raha
+### Dashboard does not open
 
-Workflow `Start application` running hai ya nahi check karein. `PORT` ke
-through configured port use karein; Replit setup mein default local port 8080
-hai.
+Confirm that the **Start application** workflow is running and that the
+configured `PORT` is available. On Replit, use the preview rather than a
+hardcoded localhost URL.
 
-### Source inaccessible
+### Source is inaccessible
 
-Userbot account ko source channel mein access hona chahiye. Private channel ke
-liye channel ID ya forwarded message se `.setsource` / `/setsource` use karein.
+The Telethon user account must be able to read the source channel. For a
+private channel, use its `-100...` ID or reply to a forwarded private-channel
+message with `.setsource` or `/setsource`.
 
 ### Target write error
 
-Userbot account ko target channel mein member/admin posting permission dein.
-Dashboard ke Channel Health panel mein target write status check karein.
+Give the Telethon account permission to post in the target channel. Check the
+Channel Health panel and confirm that the target is not read-only.
 
 ### FloodWait
 
-Rate profile ko `very_safe` ya longer delay par set karein. Bot FloodWait ko
-respect karta hai; repeated retries se pehle Telegram ka wait period complete
-hone dein.
+Do not repeatedly restart the bot or resend the same command. The bot respects
+Telegram's suggested wait for normal and bulk operations. For normal syncs,
+choose the `very_safe` rate profile or increase the pair delay, and review the
+daily and hourly limits.
 
 ### Storage limit
 
-Dashboard ke Temporary Storage panel se cleanup run karein. Large media,
-parallel tasks aur daily media limits review karein.
+Run dashboard temporary-storage cleanup, reduce parallel work, and review daily
+media limits. Large videos can require significant temporary disk space.
 
-### Thumbnail apply nahi ho raha
+### Thumbnail operation does not change old posts
 
-Confirm karein ki:
+This is expected: Telegram does not safely edit an existing video's thumbnail
+in place. The bulk command creates replacement posts and keeps originals.
+Confirm that the replied file is a valid image and that the target account can
+post videos.
 
-1. Pair mein thumbnail enabled hai.
-2. Saved file valid JPEG, PNG ya WebP hai.
-3. Message ka detected type video hai.
-4. Pair custom thumbnail upload ke baad save hua hai.
+### Caption template error
 
-## Security notes
+Use only the documented placeholders. For source captions containing Markdown
+or HTML special characters, choose plain text or escape the template
+appropriately.
 
-- Telegram credentials aur bot token sirf Replit Secrets mein rakhein.
-- Owner checks userbot aur Bot API dono paths par apply hote hain.
-- `OWNER_ID` ko correct numeric Telegram user ID par set karein.
-- `session_string.txt`, `sync_state.json`, `sync.log` aur `thumbnails/` ko
-  untrusted users ke saath share na karein.
-- Production deployment ke liye Flask development server ke bajay suitable
-  production WSGI setup use karein.
+## Security
+
+- Store Telegram credentials, bot tokens, and dashboard passwords only in
+  Replit Secrets.
+- Keep `session_string.txt`, state files, logs, and thumbnails private.
+- The userbot and Bot API paths both enforce `OWNER_ID`.
+- Review a dry run before copying a large history.
+- Treat `/force_sync`, bulk marking, and thumbnail replacement as deliberate
+  high-impact operations.
+- The bundled Flask server is suitable for the Replit workflow; use a proper
+  production WSGI setup if deploying it outside this environment.
 
 ## License
 
-License Taken by PR BOT SERVICE'S 
+Project owner / PR Bot Service.
