@@ -3978,9 +3978,11 @@ async def start_sync_userbot(event, reverse=True, min_id=0, limit=None):
         await event.edit("❌ Pehle `.setsource` aur `.settarget` karo!")
         return
     source, target = state["source"], state["target"]
-    task = _queue_sync(source, target, reverse, min_id, limit, event,
-                       False, "full" if not limit and not min_id else "range",
-                       pair_id="default")
+    mode = "last" if limit else ("full" if not min_id else "range")
+    task = _queue_sync(
+        source, target, reverse, min_id, limit, event,
+        False, mode, pair_id="default"
+    )
     await event.edit(
         f"⏳ Task `{task['id']}` queued\n"
         f"📥 {task['source_title']} → 📤 {task['target_title']}\n"
@@ -3993,9 +3995,10 @@ async def start_sync_bot(progress_msg, reverse=True, min_id=0, limit=None,
     if not state.get("source") or not state.get("target"):
         await progress_msg.edit_text("❌ Pehle /setsource aur /settarget karo!")
         return
+    mode = "last" if limit else ("full" if not min_id else "range")
     task = _queue_sync(
         state["source"], state["target"], reverse, min_id, limit,
-        progress_msg, True, "force" if force_sync else ("full" if not limit and not min_id else "range"),
+        progress_msg, True, "force" if force_sync else mode,
         pair_id="default",
         force_sync=force_sync
     )
@@ -4075,7 +4078,26 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
 
         pair_limit = config.get("max_messages", MAX_TASK_MESSAGES)
         effective_limit = min(limit, pair_limit) if limit else pair_limit
-        if min_id or max_id:
+        last_messages = None
+        if not reverse and limit and not min_id and not max_id:
+            # "Last N" means the newest N source posts, but they must be
+            # delivered oldest-to-newest so the target preserves chronology.
+            last_messages = list(
+                await client.get_messages(source_entity, limit=effective_limit)
+            )
+            last_messages.sort(key=lambda item: item.id)
+            total_count = len(last_messages)
+            _log_operation(
+                "info",
+                "Last-N source window selected",
+                phase="sync",
+                task_id=task_id,
+                requested=effective_limit,
+                first_id=last_messages[0].id if last_messages else None,
+                last_id=last_messages[-1].id if last_messages else None,
+                order="oldest_to_newest",
+            )
+        elif min_id or max_id:
             # Telethon's limit=0 path uses an unbounded GetHistoryRequest;
             # its `.total` is therefore the whole channel total even when
             # min_id/max_id were supplied. Count only the bounded range, and
@@ -4242,13 +4264,21 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         break
                     await asyncio.sleep(min(2, remaining))
 
-        async for message in client.iter_messages(
-            source_entity,
-            reverse=reverse,
-            min_id=min_id,
-            limit=effective_limit,
-            max_id=max_id,
-        ):
+        async def source_messages():
+            if last_messages is not None:
+                for selected_message in last_messages:
+                    yield selected_message
+                return
+            async for selected_message in client.iter_messages(
+                source_entity,
+                reverse=reverse,
+                min_id=min_id,
+                limit=effective_limit,
+                max_id=max_id,
+            ):
+                yield selected_message
+
+        async for message in source_messages():
             scanned += 1
             state["scanned_msgs"] = scanned
             state["source_status"] = f"Scanning ({scanned}/{total_count})"
@@ -5509,10 +5539,14 @@ async def _dry_run_pair(pair, mode="full", limit=None, min_id=0):
     source_entity = await client.get_entity(pair["source"])
     scan_limit = min(limit or config["max_messages"], config["max_messages"])
     messages = []
-    async for message in client.iter_messages(
-        source_entity, reverse=mode != "last", min_id=min_id, limit=scan_limit
-    ):
-        messages.append(message)
+    if mode == "last":
+        messages = list(await client.get_messages(source_entity, limit=scan_limit))
+        messages.sort(key=lambda item: item.id)
+    else:
+        async for message in client.iter_messages(
+            source_entity, reverse=True, min_id=min_id, limit=scan_limit
+        ):
+            messages.append(message)
     allowed = [message for message in messages if _message_allowed(message, config)]
     duplicates = [message for message in allowed if _is_duplicate(pair["id"], message)]
     media_mb = sum(_media_size_mb(message) for message in allowed)
