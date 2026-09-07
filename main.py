@@ -4052,6 +4052,10 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
     src_title  = source_title or state.get("source_title", str(source))
     tgt_title  = target_title or state.get("target_title", str(target))
     config = _normalise_runtime_config(config or _pair_config(_pair_by_id(pair_id)))
+    # Telethon's RequestIter compares max_id numerically, so never pass None
+    # even when an unbounded sync is requested.
+    min_id = int(min_id or 0)
+    max_id = int(max_id or 0)
 
     try:
         source_entity = await client.get_entity(source)
@@ -4081,7 +4085,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                 source_entity,
                 reverse=reverse,
                 min_id=min_id,
-                max_id=max_id or None,
+                max_id=max_id,
                 limit=effective_limit,
                 wait_time=0,
             ):
