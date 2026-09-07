@@ -121,9 +121,12 @@ RATE_PROFILES = {"very_safe": 5, "balanced": 3, "slow": 10}
 MESSAGE_TYPES = {"text", "photo", "video", "doc", "other"}
 DEFAULT_DAILY_MESSAGES = MAX_TASK_MESSAGES
 DEFAULT_DAILY_MEDIA_MB = 2048
-# Keep a safety margin on the small Replit disk.  This is a hard temporary
-# storage ceiling, not a promise that the host has this much free space.
-TEMP_STORAGE_LIMIT_BYTES = 1_800 * 1024 * 1024
+DEFAULT_TEMP_STORAGE_LIMIT_MB = 1_800
+MIN_TEMP_STORAGE_LIMIT_MB = 128
+MAX_TEMP_STORAGE_LIMIT_MB = 102_400
+# Keep a safety margin on the small Replit disk by default. This configurable
+# ceiling is not a promise that the host has this much free space.
+TEMP_STORAGE_LIMIT_BYTES = DEFAULT_TEMP_STORAGE_LIMIT_MB * 1024 * 1024
 TEMP_DIR = Path("/tmp/archive_bot")
 THUMBNAIL_DIR = Path("thumbnails")
 
@@ -144,6 +147,38 @@ def _bounded_float(value, default, minimum, maximum):
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(value, maximum))
+
+
+def _storage_limit_mb():
+    return _bounded_int(
+        state.get("storage_limit_mb", DEFAULT_TEMP_STORAGE_LIMIT_MB),
+        DEFAULT_TEMP_STORAGE_LIMIT_MB,
+        MIN_TEMP_STORAGE_LIMIT_MB,
+        MAX_TEMP_STORAGE_LIMIT_MB,
+    )
+
+
+def _parse_storage_limit(value):
+    """Accept MB numbers plus convenient MB/GB suffixes for bot commands."""
+    text = str(value or "").strip().lower().replace(" ", "")
+    multiplier = 1
+    if text.endswith("gb"):
+        multiplier = 1024
+        text = text[:-2]
+    elif text.endswith("mb"):
+        text = text[:-2]
+    try:
+        megabytes = float(text) * multiplier
+    except (TypeError, ValueError):
+        raise ValueError("Limit number ya MB/GB format mein do, jaise 2048 ya 2GB")
+    if not megabytes.is_integer():
+        raise ValueError("Storage limit whole MB mein set karo")
+    return _bounded_int(
+        int(megabytes),
+        DEFAULT_TEMP_STORAGE_LIMIT_MB,
+        MIN_TEMP_STORAGE_LIMIT_MB,
+        MAX_TEMP_STORAGE_LIMIT_MB,
+    )
 
 
 def _normalise_types(value, fallback=None):
@@ -434,6 +469,7 @@ _LOCAL_STATE_PRESENT = any(
 )
 state = load_state()
 state.setdefault("auto_forward", False)
+state.setdefault("storage_limit_mb", DEFAULT_TEMP_STORAGE_LIMIT_MB)
 state.setdefault("tasks", [])
 state.setdefault("auto_stats", {"sent": 0, "failed": 0, "duplicates": 0})
 state["auto_stats"].setdefault("duplicates", 0)
@@ -501,6 +537,7 @@ if _state_batches_changed:
 def _ensure_state_defaults_after_restore():
     """Keep a restored backup compatible with the current runtime."""
     state.setdefault("auto_forward", False)
+    state.setdefault("storage_limit_mb", DEFAULT_TEMP_STORAGE_LIMIT_MB)
     state.setdefault("tasks", [])
     state.setdefault("auto_stats", {"sent": 0, "failed": 0, "duplicates": 0})
     state["auto_stats"].setdefault("duplicates", 0)
@@ -873,17 +910,18 @@ def _temp_usage_bytes():
 
 def _storage_snapshot():
     usage = _temp_usage_bytes()
+    limit_bytes = _storage_limit_mb() * 1024 * 1024
     try:
         free = shutil.disk_usage("/tmp").free
     except OSError:
         free = 0
     return {
-        "limit_bytes": TEMP_STORAGE_LIMIT_BYTES,
+        "limit_bytes": limit_bytes,
         "used_bytes": usage,
-        "available_bytes": max(0, min(TEMP_STORAGE_LIMIT_BYTES - usage, free)),
+        "available_bytes": max(0, min(limit_bytes - usage, free)),
         "used_mb": round(usage / 1048576, 2),
-        "limit_mb": round(TEMP_STORAGE_LIMIT_BYTES / 1048576, 2),
-        "available_mb": round(max(0, min(TEMP_STORAGE_LIMIT_BYTES - usage, free)) / 1048576, 2),
+        "limit_mb": round(limit_bytes / 1048576, 2),
+        "available_mb": round(max(0, min(limit_bytes - usage, free)) / 1048576, 2),
     }
 
 
@@ -1925,6 +1963,12 @@ HELP_CATEGORIES = [
                 "why": "Source, target, pairs aur important defaults check karo before a sync.",
                 "usage": "/info  or  .info",
             },
+            {
+                "commands": ["/storage_limit", ".storage_limit"],
+                "title": "Temporary disk limit set karna",
+                "why": "Media download ke temporary disk budget ko available storage ke hisaab se change karne ke liye.",
+                "usage": "/storage_limit 4096\n.storage_limit 4GB\nRange: 128–102400 MB",
+            },
         ],
     },
     {
@@ -2751,6 +2795,7 @@ def _reset_state_defaults():
         "tasks": [],
         "task_controls": {},
         "auto_forward": False,
+        "storage_limit_mb": DEFAULT_TEMP_STORAGE_LIMIT_MB,
         "auto_stats": {"sent": 0, "failed": 0, "duplicates": 0},
         "backup_channel": DEFAULT_BACKUP_CHANNEL,
         "backup_last_upload_epoch": 0,
@@ -2802,6 +2847,41 @@ async def cmd_reset(event):
     _reset_state_defaults()
     save_state(state)
     await event.edit("🔄 Config reset!")
+
+
+@client.on(events.NewMessage(
+    outgoing=True,
+    pattern=r"^\.storage_limit(?:\s+(\S+))?$",
+))
+async def cmd_storage_limit(event):
+    if not is_owner(event.sender_id):
+        return
+    value = event.pattern_match.group(1)
+    if not value:
+        await event.edit(
+            f"💾 Current temporary storage limit: `{_storage_limit_mb()} MB`\n"
+            "Set: `.storage_limit 4096` or `.storage_limit 4GB`\n"
+            f"Allowed range: {MIN_TEMP_STORAGE_LIMIT_MB}–{MAX_TEMP_STORAGE_LIMIT_MB} MB"
+        )
+        return
+    try:
+        limit_mb = _parse_storage_limit(value)
+    except ValueError as error:
+        await event.edit(f"❌ {error}")
+        return
+    state["storage_limit_mb"] = limit_mb
+    save_state(state)
+    _log_operation(
+        "info",
+        "Temporary storage limit updated",
+        phase="config",
+        source="userbot",
+        limit_mb=limit_mb,
+    )
+    await event.edit(
+        f"✅ Temporary storage limit `{limit_mb} MB` set ho gayi.\n"
+        f"Current available: `{_storage_snapshot()['available_mb']} MB`"
+    )
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^\.sync$"))
@@ -3720,6 +3800,43 @@ async def bot_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _reset_state_defaults()
     save_state(state)
     await update.message.reply_text("🔄 Config reset kar diya!")
+
+
+async def bot_storage_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bot_is_owner(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"💾 Current temporary storage limit: {_storage_limit_mb()} MB\n"
+            "Set: /storage_limit 4096 or /storage_limit 4GB\n"
+            f"Allowed range: {MIN_TEMP_STORAGE_LIMIT_MB}–{MAX_TEMP_STORAGE_LIMIT_MB} MB"
+        )
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "❌ Usage: /storage_limit <MB|GB>\n"
+            "Example: /storage_limit 4096 or /storage_limit 4GB"
+        )
+        return
+    try:
+        limit_mb = _parse_storage_limit(context.args[0])
+    except ValueError as error:
+        await update.message.reply_text(f"❌ {error}")
+        return
+    state["storage_limit_mb"] = limit_mb
+    save_state(state)
+    _log_operation(
+        "info",
+        "Temporary storage limit updated",
+        phase="config",
+        source="bot",
+        limit_mb=limit_mb,
+    )
+    await update.message.reply_text(
+        f"✅ Temporary storage limit {limit_mb} MB set ho gayi.\n"
+        f"Current available: {_storage_snapshot()['available_mb']} MB"
+    )
+
 
 async def bot_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_is_owner(update):
@@ -5843,12 +5960,19 @@ def api_settings():
                 settings[key] = bool(payload[key])
         if "auto_forward" in payload:
             state["auto_forward"] = bool(payload["auto_forward"])
+        if "storage_limit_mb" in payload:
+            try:
+                state["storage_limit_mb"] = _parse_storage_limit(
+                    payload["storage_limit_mb"]
+                )
+            except ValueError as error:
+                return jsonify({"ok": False, "error": str(error)}), 400
         save_state(state)
     return jsonify({
         "ok": True,
         "notification_settings": settings,
         "auto_forward": bool(state.get("auto_forward")),
-        "storage_limit_mb": round(TEMP_STORAGE_LIMIT_BYTES / 1048576),
+        "storage_limit_mb": _storage_limit_mb(),
         "max_task_messages": MAX_TASK_MESSAGES,
         "persistence": _status_payload()["persistence"],
     })
@@ -6651,7 +6775,7 @@ async def main():
         "info",
         "Telegram bot application configured",
         phase="startup",
-        handler_count=18,
+        handler_count=19,
     )
 
     app.add_handler(CommandHandler("start", bot_start))
@@ -6665,6 +6789,7 @@ async def main():
     app.add_handler(CommandHandler("resume", bot_resume))
     app.add_handler(CommandHandler("stop", bot_stop))
     app.add_handler(CommandHandler("reset", bot_reset))
+    app.add_handler(CommandHandler("storage_limit", bot_storage_limit))
     app.add_handler(CommandHandler("sync", bot_sync))
     app.add_handler(CommandHandler("force_sync", bot_force_sync))
     app.add_handler(CommandHandler("syncfrom", bot_syncfrom))
