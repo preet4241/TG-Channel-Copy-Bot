@@ -4247,7 +4247,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             reverse=reverse,
             min_id=min_id,
             limit=effective_limit,
-            max_id=max_id or None
+            max_id=max_id,
         ):
             scanned += 1
             state["scanned_msgs"] = scanned
@@ -4862,6 +4862,18 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
     if not raw_text and not has_media:
         logger.debug("Skipping non-content Telegram service message msg_id=%s", message.id)
         return False
+    if has_media and msg_type == "other":
+        media_name = type(message.media).__name__
+        _log_operation(
+            "warning",
+            "Unsupported Telegram media skipped",
+            phase="media",
+            message_id=message.id,
+            media_type=media_name,
+            reason="This media type cannot be downloaded and re-uploaded reliably",
+        )
+        _log_live(f"⏭️ Unsupported media skipped ID={message.id} ({media_name})")
+        return False
     if source_restricted and config.get("protected_behavior") == "skip":
         _log_live(f"⏭️ Protected-content skipped ID={message.id}")
         return False
@@ -4925,6 +4937,11 @@ async def send_message(target, message, on_progress=None, config=None, source_ti
         )
         if not tmp_path or not Path(tmp_path).exists():
             raise Exception("Media download failed")
+        if Path(tmp_path).stat().st_size <= 0:
+            Path(tmp_path).unlink(missing_ok=True)
+            raise ValueError(
+                f"Telegram returned an empty file for unsupported media type {type(message.media).__name__}"
+            )
 
         caption = _edited_caption(message, config, source_title)
         send_path = Path(tmp_path)
