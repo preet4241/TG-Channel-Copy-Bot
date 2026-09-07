@@ -4351,13 +4351,24 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         continue
                     handled_albums.add(grouped_id)
                     album = [item for item in album if _message_allowed(item, config)]
+                    duplicate_album_items = []
                     for item in album:
                         _reconcile_target_mapping(pair_id, item, target_message_ids)
-                    duplicate_album_items = [
-                        item for item in album
-                        if _is_duplicate(pair_id, item)
-                        or bool(_target_identity_keys(item) & target_index)
-                    ]
+                        target_match = bool(_target_identity_keys(item) & target_index)
+                        if target_match:
+                            _record_dedupe(pair_id, item)
+                            duplicate_album_items.append(item)
+                        elif _is_duplicate(pair_id, item):
+                            removed = _forget_dedupe(pair_id, item)
+                            _log_operation(
+                                "info",
+                                "Stale local dedupe released",
+                                phase="dedupe",
+                                pair_id=pair_id,
+                                source_message_id=getattr(item, "id", None),
+                                removed_identities=removed,
+                                reason="target_copy_not_found",
+                            )
                     if duplicate_album_items:
                         stats["duplicates"] = stats.get("duplicates", 0) + len(duplicate_album_items)
                         state["stats"] = stats
@@ -4467,15 +4478,25 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             dedupe = state.setdefault("dedupe", {})
             dkey = _dedupe_key(pair_id, message)
             target_match = bool(_target_identity_keys(message) & target_index)
-            if _is_duplicate(pair_id, message) or target_match:
+            local_duplicate = _is_duplicate(pair_id, message)
+            if target_match:
                 stats["duplicates"] = stats.get("duplicates", 0) + 1
-                if target_match:
-                    _record_dedupe(pair_id, message)
+                _record_dedupe(pair_id, message)
                 state["stats"] = stats
                 _dashboard_changed()
-                reason = "target mein pehle se maujood" if target_match else "state mein recorded"
-                _log_live(f"⏭️ Duplicate skipped ID={message.id} ({reason})")
+                _log_live(f"⏭️ Duplicate skipped ID={message.id} (target mein pehle se maujood)")
                 continue
+            if local_duplicate:
+                removed = _forget_dedupe(pair_id, message)
+                _log_operation(
+                    "info",
+                    "Stale local dedupe released",
+                    phase="dedupe",
+                    pair_id=pair_id,
+                    source_message_id=getattr(message, "id", None),
+                    removed_identities=removed,
+                    reason="target_copy_not_found",
+                )
             budget_ok, budget_bucket, permanently_oversized = (
                 (True, None, False)
                 if force_sync
