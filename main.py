@@ -800,6 +800,21 @@ def _pair_config(pair):
     }
 
 
+def _normalise_runtime_config(config):
+    """Sanitize settings loaded from older state or dashboard JSON before sync."""
+    normalized = _pair_config(None)
+    normalized.update(config or {})
+    for key in (
+        "rate_delay",
+        "max_messages",
+        "daily_message_limit",
+        "daily_media_mb",
+        "max_posts_per_hour",
+    ):
+        normalized[key] = _normalise_pair_setting(key, normalized.get(key))
+    return normalized
+
+
 def _telegram_buttons(config):
     return [
         Button.url(button["text"], button["url"])
@@ -1130,14 +1145,25 @@ def _daily_budget(pair_id, config, message, commit=False, source_entity=None):
     if bucket.get("date") != today:
         bucket.update({"date": today, "messages": 0, "media_mb": 0.0})
     size_mb = _media_size_mb(message)
-    daily_media_limit = config.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)
+    daily_media_limit = _bounded_int(
+        config.get("daily_media_mb"),
+        DEFAULT_DAILY_MEDIA_MB,
+        1,
+        102400,
+    )
+    daily_message_limit = _bounded_int(
+        config.get("daily_message_limit"),
+        DEFAULT_DAILY_MESSAGES,
+        1,
+        MAX_TASK_MESSAGES,
+    )
     # Direct Telegram copies never touch local storage, so the download/upload
     # media quota must not block them regardless of their source file size.
     requires_download = _media_requires_download(message, config, source_entity)
     billable_media_mb = size_mb if requires_download else 0
     permanently_oversized = requires_download and size_mb > daily_media_limit
     allowed = (
-        bucket["messages"] < config.get("daily_message_limit", DEFAULT_DAILY_MESSAGES)
+        bucket["messages"] < daily_message_limit
         and bucket["media_mb"] + billable_media_mb <= daily_media_limit
     )
     if allowed and commit:
@@ -4025,7 +4051,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
 
     src_title  = source_title or state.get("source_title", str(source))
     tgt_title  = target_title or state.get("target_title", str(target))
-    config = config or _pair_config(_pair_by_id(pair_id))
+    config = _normalise_runtime_config(config or _pair_config(_pair_by_id(pair_id)))
 
     try:
         source_entity = await client.get_entity(source)
@@ -4263,7 +4289,12 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         if force_sync:
                             sendable_album = album
                         else:
-                            daily_media_limit = config.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB)
+                            daily_media_limit = _bounded_int(
+                                config.get("daily_media_mb"),
+                                DEFAULT_DAILY_MEDIA_MB,
+                                1,
+                                102400,
+                            )
                             budget_results = [
                                 (item, *_daily_budget(
                                     pair_id, config, item, source_entity=source_entity
@@ -4379,7 +4410,12 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                     await record_permanently_oversized(
                         message,
                         _media_size_mb(message),
-                        config.get("daily_media_mb", DEFAULT_DAILY_MEDIA_MB),
+                        _bounded_int(
+                            config.get("daily_media_mb"),
+                            DEFAULT_DAILY_MEDIA_MB,
+                            1,
+                            102400,
+                        ),
                     )
                     continue
                 state["_task_pause_requested"] = True
@@ -4775,7 +4811,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
         await edit_msg("❌ Source channel private hai ya access nahi hai!")
 
     except Exception as e:
-        logger.error(f"Fatal sync error: {e}")
+        logger.exception("Fatal sync error: %s", e)
         _log_operation(
             "error",
             "Sync failed",
