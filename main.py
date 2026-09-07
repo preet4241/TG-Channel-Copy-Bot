@@ -996,6 +996,7 @@ def _target_identity_keys(message):
 async def _analyse_target_channel(target_entity, pair_id, edit_msg):
     """Inventory the complete target before a sync is allowed to send."""
     target_index = set()
+    target_message_ids = set()
     scanned = 0
     state["source_status"] = "Analyzing target"
     state["target_scan"] = {
@@ -1019,6 +1020,8 @@ async def _analyse_target_channel(target_entity, pair_id, edit_msg):
     )
     async for target_message in client.iter_messages(target_entity, reverse=True):
         scanned += 1
+        if getattr(target_message, "id", None) is not None:
+            target_message_ids.add(str(target_message.id))
         target_index.update(_target_identity_keys(target_message))
         if scanned % 100 == 0:
             state["target_scan"]["scanned"] = scanned
@@ -1042,9 +1045,10 @@ async def _analyse_target_channel(target_entity, pair_id, edit_msg):
         target=getattr(target_entity, "title", str(target_entity)),
         scanned=scanned,
         identities=len(target_index),
+        message_ids=len(target_message_ids),
     )
     _log_live(f"✅ Target channel analysis complete: {scanned} messages checked")
-    return target_index
+    return target_index, target_message_ids
 
 
 def _time_in_window(now, start, end):
@@ -1471,6 +1475,43 @@ def _record_dedupe(pair_id, message):
     fingerprint = _media_fingerprint(message)
     if fingerprint:
         dedupe[fingerprint] = stamp
+
+
+def _forget_dedupe(pair_id, message):
+    """Remove local identities for a source post whose target copy was deleted."""
+    keys = {
+        _dedupe_key(pair_id, message),
+        _strong_dedupe_key(pair_id, message),
+    }
+    fingerprint = _media_fingerprint(message)
+    if fingerprint:
+        keys.add(fingerprint)
+    dedupe = state.setdefault("dedupe", {})
+    removed = sum(1 for key in keys if key in dedupe)
+    for key in keys:
+        dedupe.pop(key, None)
+    return removed
+
+
+def _reconcile_target_mapping(pair_id, message, target_message_ids):
+    """Forget a stale source mapping when its target message no longer exists."""
+    mapping = state.setdefault("message_map", {}).setdefault(str(pair_id), {})
+    source_id = str(getattr(message, "id", ""))
+    target_id = mapping.get(source_id)
+    if target_id is None or str(target_id) in target_message_ids:
+        return False
+    removed = _forget_dedupe(pair_id, message)
+    mapping.pop(source_id, None)
+    _log_operation(
+        "info",
+        "Deleted target copy reconciled",
+        phase="dedupe",
+        pair_id=pair_id,
+        source_message_id=getattr(message, "id", None),
+        deleted_target_message_id=target_id,
+        removed_identities=removed,
+    )
+    return True
 
 
 def _remember_mapping(pair_id, source_id, sent):
@@ -4072,7 +4113,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
             source=src_title,
             target=tgt_title,
         )
-        target_index = await _analyse_target_channel(
+        target_index, target_message_ids = await _analyse_target_channel(
             target_entity, pair_id, edit_msg
         )
 
@@ -4310,6 +4351,8 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                         continue
                     handled_albums.add(grouped_id)
                     album = [item for item in album if _message_allowed(item, config)]
+                    for item in album:
+                        _reconcile_target_mapping(pair_id, item, target_message_ids)
                     duplicate_album_items = [
                         item for item in album
                         if _is_duplicate(pair_id, item)
@@ -4420,6 +4463,7 @@ async def _run_sync(progress_msg, source, target, reverse, min_id, limit,
                 _dashboard_changed()
                 _log_live(f"⏭️ Filter skipped ID={message.id}")
                 continue
+            _reconcile_target_mapping(pair_id, message, target_message_ids)
             dedupe = state.setdefault("dedupe", {})
             dkey = _dedupe_key(pair_id, message)
             target_match = bool(_target_identity_keys(message) & target_index)
